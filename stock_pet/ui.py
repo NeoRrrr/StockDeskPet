@@ -4,8 +4,8 @@ import math
 import os
 from html import escape
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QFontDatabase, QMouseEvent, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSlider,
     QStyledItemDelegate,
@@ -37,6 +38,11 @@ from .models import Quote, StockSearchResult
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
 from .symbols import SymbolError, normalize_symbol, normalize_watchlist, partition_watchlist
+from .update_checker import (
+    PROJECT_URL,
+    AutomaticUpdateResult,
+    check_download_and_install,
+)
 
 
 SPRITE_CELL_WIDTH = 192
@@ -181,6 +187,32 @@ class SearchTask(QRunnable):
             self.signals.finished.emit((self.query, results, ""))
         except Exception as exc:
             self.signals.finished.emit((self.query, [], str(exc)))
+
+
+class UpdateTaskSignals(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+    phase = Signal(str)
+    progress = Signal(int)
+
+
+class UpdateCheckTask(QRunnable):
+    def __init__(self, current_version: str) -> None:
+        super().__init__()
+        self.current_version = current_version
+        self.signals = UpdateTaskSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = check_download_and_install(
+                self.current_version,
+                phase_callback=self.signals.phase.emit,
+                progress_callback=self.signals.progress.emit,
+            )
+            self.signals.finished.emit(result)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
 
 
 class QuoteItemDelegate(QStyledItemDelegate):
@@ -508,6 +540,196 @@ class WatchlistDialog(QDialog):
         self.accept()
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, theme: str = "dark", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        _load_ui_fonts()
+        self._update_task: UpdateCheckTask | None = None
+        self._release_url = f"{PROJECT_URL}/releases"
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.setFixedSize(430, 338)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(14)
+
+        title = QLabel("设置")
+        title.setObjectName("settingsTitle")
+        subtitle = QLabel("应用信息与版本更新")
+        subtitle.setObjectName("settingsSubtitle")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        version_card = QFrame()
+        version_card.setObjectName("versionCard")
+        version_layout = QVBoxLayout(version_card)
+        version_layout.setContentsMargins(16, 14, 16, 14)
+        version_layout.setSpacing(8)
+        app_row = QHBoxLayout()
+        app_name = QLabel("StockDeskPet 股票桌宠")
+        app_name.setObjectName("appName")
+        self.current_version_label = QLabel(f"当前版本  v{__version__}")
+        self.current_version_label.setObjectName("versionValue")
+        app_row.addWidget(app_name)
+        app_row.addStretch()
+        app_row.addWidget(self.current_version_label)
+        version_layout.addLayout(app_row)
+
+        self.update_status = QLabel("点击一次即可检查、下载、替换并重启")
+        self.update_status.setObjectName("updateStatus")
+        self.update_status.setWordWrap(True)
+        version_layout.addWidget(self.update_status)
+
+        self.update_progress = QProgressBar()
+        self.update_progress.setObjectName("updateProgress")
+        self.update_progress.setRange(0, 100)
+        self.update_progress.setValue(0)
+        self.update_progress.setTextVisible(True)
+        self.update_progress.hide()
+        version_layout.addWidget(self.update_progress)
+        layout.addWidget(version_card)
+
+        actions = QHBoxLayout()
+        self.check_update_button = QPushButton("检查并更新")
+        self.check_update_button.setObjectName("primaryButton")
+        self.check_update_button.clicked.connect(self.check_for_updates)
+        self.open_release_button = QPushButton("查看发布页")
+        self.open_release_button.setObjectName("secondaryButton")
+        self.open_release_button.clicked.connect(self.open_release_page)
+        project_button = QPushButton("项目主页")
+        project_button.setObjectName("secondaryButton")
+        project_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(PROJECT_URL))
+        )
+        actions.addWidget(self.check_update_button)
+        actions.addWidget(self.open_release_button)
+        actions.addWidget(project_button)
+        layout.addLayout(actions)
+        layout.addStretch()
+
+        close_button = QPushButton("关闭")
+        close_button.setObjectName("closeSettingsButton")
+        close_button.clicked.connect(self.accept)
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        stylesheet = """
+            QDialog { background: #0c1622; }
+            QLabel { color: #c8d2df; font-family: "Noto Sans SC"; }
+            QLabel#settingsTitle { color: #eef4fb; font: 600 20px "Microsoft YaHei UI"; }
+            QLabel#settingsSubtitle { color: #7f90a5; font-size: 12px; }
+            QFrame#versionCard {
+                background: #101b28; border: 1px solid #32445b; border-radius: 10px;
+            }
+            QLabel#appName { color: #e8eff8; font: 600 14px "Noto Sans SC"; }
+            QLabel#versionValue { color: #91a5bd; font-size: 12px; }
+            QLabel#updateStatus { color: #91a5bd; font-size: 12px; }
+            QPushButton {
+                border-radius: 8px; padding: 7px 12px; font: 600 12px "Noto Sans SC";
+            }
+            QPushButton#primaryButton { color: white; background: #2467d8; border: 1px solid #397bec; }
+            QPushButton#primaryButton:hover { background: #3278e8; }
+            QPushButton#primaryButton:disabled { background: #26364a; color: #74859b; }
+            QProgressBar#updateProgress {
+                color: #dce8f7; background: #0c1622; border: 1px solid #32445b;
+                border-radius: 5px; height: 10px; text-align: center; font-size: 9px;
+            }
+            QProgressBar#updateProgress::chunk { background: #397bec; border-radius: 4px; }
+            QPushButton#secondaryButton, QPushButton#closeSettingsButton {
+                color: #a8b6c8; background: #111e2c; border: 1px solid #32445b;
+            }
+            QPushButton#secondaryButton:hover, QPushButton#closeSettingsButton:hover {
+                color: #eef5ff; border-color: #4b83e3; background: #16263a;
+            }
+        """
+        if theme == "beige":
+            stylesheet += """
+                QDialog { background: #f6f8fb; }
+                QLabel { color: #243247; }
+                QLabel#settingsTitle { color: #17253a; }
+                QLabel#settingsSubtitle, QLabel#versionValue, QLabel#updateStatus { color: #68778c; }
+                QFrame#versionCard { background: #ffffff; border-color: #c6d2e1; }
+                QLabel#appName { color: #1f2d42; }
+                QProgressBar#updateProgress { color: #40516a; background: #e8eef6; border-color: #c6d2e1; }
+                QProgressBar#updateProgress::chunk { background: #2d6ed8; }
+                QPushButton#primaryButton { background: #2d6ed8; border-color: #2d6ed8; }
+                QPushButton#primaryButton:hover { background: #3b7de7; }
+                QPushButton#secondaryButton, QPushButton#closeSettingsButton {
+                    color: #40516a; background: #f0f4f9; border-color: #c6d2e1;
+                }
+                QPushButton#secondaryButton:hover, QPushButton#closeSettingsButton:hover {
+                    color: #1e56af; border-color: #6b97dc; background: #e7effb;
+                }
+            """
+        self.setStyleSheet(stylesheet)
+
+    @Slot()
+    def check_for_updates(self) -> None:
+        if self._update_task is not None:
+            return
+        self.check_update_button.setDisabled(True)
+        self.check_update_button.setText("检查中…")
+        self.update_progress.setValue(0)
+        self.update_progress.hide()
+        self.update_status.setText("正在连接 GitHub Releases…")
+        task = UpdateCheckTask(__version__)
+        task.signals.finished.connect(self._on_update_info)
+        task.signals.failed.connect(self._on_update_error)
+        task.signals.phase.connect(self._on_update_phase)
+        task.signals.progress.connect(self._on_update_progress)
+        self._update_task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_update_info(self, info: AutomaticUpdateResult) -> None:
+        self._release_url = info.release_url
+        if info.status == "restart_pending":
+            self.update_status.setText(
+                f"v{info.latest_version} 已下载，正在退出并完成替换…"
+            )
+            self.update_progress.setValue(100)
+            self.check_update_button.setText("正在重启…")
+            QTimer.singleShot(600, QApplication.instance().quit)
+            return
+        self._finish_update_check()
+        if info.status == "manual":
+            self.update_status.setText(
+                f"发现 v{info.latest_version}。当前是旧版单文件程序，需安装一次新版。"
+            )
+            self.open_release_button.setText("下载安装版")
+        else:
+            self.update_status.setText(f"已是最新版本 v{info.current_version}。")
+            self.open_release_button.setText("查看发布页")
+
+    @Slot(str)
+    def _on_update_phase(self, message: str) -> None:
+        self.update_status.setText(message)
+        if "下载" in message:
+            self.check_update_button.setText("下载中…")
+
+    @Slot(int)
+    def _on_update_progress(self, value: int) -> None:
+        self.update_progress.show()
+        self.update_progress.setValue(max(0, min(100, value)))
+
+    @Slot(str)
+    def _on_update_error(self, message: str) -> None:
+        self._finish_update_check()
+        self.update_status.setText(message)
+
+    def _finish_update_check(self) -> None:
+        self._update_task = None
+        self.check_update_button.setDisabled(False)
+        self.check_update_button.setText("检查并更新")
+
+    @Slot()
+    def open_release_page(self) -> None:
+        QDesktopServices.openUrl(QUrl(self._release_url))
+
+
 class QuotePanel(QWidget):
     quote_loaded = Signal(object)
     loading_changed = Signal(bool)
@@ -573,7 +795,7 @@ class QuotePanel(QWidget):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel(f"股票桌宠 · v{__version__}")
+        title = QLabel("股票桌宠")
         title.setObjectName("title")
         self.theme_switch = ThemeSwitch()
         self.theme_switch.setChecked(self.current_theme == "beige")
@@ -581,6 +803,9 @@ class QuotePanel(QWidget):
         manage_button = QPushButton("编辑自选")
         manage_button.setObjectName("headerButton")
         manage_button.clicked.connect(self.manage_watchlist)
+        settings_button = QPushButton("设置")
+        settings_button.setObjectName("headerButton")
+        settings_button.clicked.connect(self.open_settings)
         close_button = QPushButton("×")
         close_button.setObjectName("closeButton")
         close_button.setFixedSize(28, 28)
@@ -589,6 +814,7 @@ class QuotePanel(QWidget):
         header.addStretch()
         header.addWidget(self.theme_switch)
         header.addWidget(manage_button)
+        header.addWidget(settings_button)
         header.addWidget(close_button)
         layout.addLayout(header)
 
@@ -716,7 +942,16 @@ class QuotePanel(QWidget):
         self.status_label = QLabel("数据源：腾讯行情公共网页接口；行情可能延迟，仅供参考")
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        self.footer_version_label = QLabel(f"v{__version__}")
+        self.footer_version_label.setObjectName("footerVersion")
+        self.footer_version_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom
+        )
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+        footer.addWidget(self.status_label, 1)
+        footer.addWidget(self.footer_version_label)
+        layout.addLayout(footer)
 
         self._dark_stylesheet = (
             """
@@ -742,6 +977,7 @@ class QuotePanel(QWidget):
             QLabel#marketSummaryCell { color: #b7c4d5; font-size: 10px; }
             QFrame#summaryDivider { background: #2f4055; border: none; }
             QLabel#status { color: #73849a; font-size: 10px; }
+            QLabel#footerVersion { color: #596b82; font-size: 10px; }
             QLabel#monitor { color: #7f90a5; font-size: 10px; }
             QLabel#opacityLabel, QLabel#opacityValue { color: #7f90a5; font-size: 10px; }
             QTabWidget#marketTabs::pane {
@@ -847,6 +1083,7 @@ class QuotePanel(QWidget):
             QLabel#marketSummaryCell { color: #40516a; }
             QFrame#summaryDivider { background: #cbd6e3; }
             QLabel#status, QLabel#monitor, QLabel#opacityLabel, QLabel#opacityValue { color: #6d7d91; }
+            QLabel#footerVersion { color: #8896a8; }
             QTabWidget#marketTabs::pane {
                 background: #f8fafc; border-color: #c4d0df;
             }
@@ -1439,6 +1676,10 @@ class QuotePanel(QWidget):
             return
         self._save_watchlist_config(*dialog.saved_config)
         self.status_label.setText("自选股和提醒设置已保存。")
+
+    @Slot()
+    def open_settings(self) -> None:
+        SettingsDialog(theme=self.current_theme, parent=self).exec()
 
     def _save_watchlist_config(
         self,

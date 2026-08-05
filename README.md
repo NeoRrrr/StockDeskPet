@@ -7,6 +7,7 @@ Windows 股票桌宠 MVP：点击桌宠立即刷新当前行情页。支持港�
 - 透明、无边框、始终置顶的牛市桌宠
 - 标题栏滑动开关切换深色/浅色主题；行情卡、编辑窗和桌宠气泡同步换肤并自动保存选择
 - 行情卡支持 `90%–100%` 显示透明度并自动保存，避免透明度过低看不清内容
+- 独立设置页显示当前版本；安装版可一键检查、下载、替换并自动重启
 - 左键拖动并记住位置
 - 单击桌宠：打开行情卡并刷新当前 Tab
 - 搜索框支持股票代码和名称；输入“小米”“腾讯”“贵州茅台”等名称会弹出大A/港股候选，选择后直接拉取行情
@@ -84,7 +85,17 @@ python -m unittest discover -s tests -v
 .\build.ps1
 ```
 
-生成文件：`dist\StockDeskPet.exe`。
+生成目录：`dist\StockDeskPet\`。Velopack 要求 PyInstaller 使用 `onedir`，不支持 `onefile`。
+
+同时生成一键安装包和自动更新包：
+
+```powershell
+.\build.ps1 -Package
+```
+
+安装包与更新文件位于 `Releases\`。安装后的“设置 → 检查并更新”会从本项目的 GitHub Releases 下载新版本，替换完成后自动重启。
+
+推送 `v*` Tag 会触发 GitHub Actions：自动构建 Windows 安装包、生成增量更新并发布对应 Release。
 
 ## 行情边界
 
