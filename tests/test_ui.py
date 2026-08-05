@@ -16,6 +16,7 @@ from stock_pet.ui import (
     INDEX_SYMBOLS,
     TAB_MARKET_SUMMARIES,
     QuotePanel,
+    ThemeSwitch,
 )
 
 
@@ -33,6 +34,13 @@ class QuotePanelTests(unittest.TestCase):
             panel = QuotePanel(TencentQuoteProvider(), settings)
             captured: list[list[str]] = []
             panel.page_refresh_requested.connect(lambda symbols: captured.append(list(symbols)))
+            panel.show()
+            self.app.processEvents()
+
+            tab_bar = panel.market_tabs.tabBar()
+            tab_widths = [tab_bar.tabRect(index).width() for index in range(tab_bar.count())]
+            self.assertLessEqual(max(tab_widths) - min(tab_widths), 1)
+            self.assertEqual(tab_bar.width(), panel.market_tabs.width())
 
             self.assertEqual(
                 panel.a_share_list.currentItem().data(Qt.ItemDataRole.UserRole),
@@ -55,10 +63,21 @@ class QuotePanelTests(unittest.TestCase):
                 panel.index_list.currentItem().data(Qt.ItemDataRole.UserRole),
                 INDEX_SYMBOLS[0],
             )
-            self.assertEqual(panel.market_summary_label.text(), "")
+            self.assertTrue(panel.market_summary_frame.isHidden())
             button_texts = {button.text() for button in panel.findChildren(QPushButton)}
             self.assertIn("刷新当前页", button_texts)
             self.assertNotIn("检查自选", button_texts)
+            self.assertIsInstance(panel.theme_switch, ThemeSwitch)
+            self.assertFalse(panel.theme_switch.isChecked())
+
+            theme_changes: list[str] = []
+            panel.theme_changed.connect(theme_changes.append)
+
+            panel.toggle_theme()
+            self.assertEqual(panel.current_theme, "beige")
+            self.assertEqual(settings.value("theme"), "beige")
+            self.assertTrue(panel.theme_switch.isChecked())
+            self.assertEqual(theme_changes, ["beige"])
             panel.close()
 
 
