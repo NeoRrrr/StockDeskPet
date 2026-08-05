@@ -888,6 +888,7 @@ class QuotePanel(QWidget):
         self.symbol_input = QLineEdit()
         self.symbol_input.setText(last_symbol)
         self.symbol_input.setPlaceholderText("代码或名称：01810 / 小米 / HSI")
+        self.symbol_input.setClearButtonEnabled(True)
         self._search_model = QStringListModel(self)
         self.search_completer = QCompleter(self._search_model, self)
         self.search_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -899,13 +900,10 @@ class QuotePanel(QWidget):
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(350)
         self._search_timer.timeout.connect(self._search_by_name)
+        self.symbol_input.textChanged.connect(self._on_search_text_changed)
         self.symbol_input.textEdited.connect(self._schedule_name_search)
         self.symbol_input.returnPressed.connect(self.search_or_fetch)
-        self.fetch_button = QPushButton("拉取行情")
-        self.fetch_button.setObjectName("fetchButton")
-        self.fetch_button.clicked.connect(self.search_or_fetch)
         search.addWidget(self.symbol_input, 1)
-        search.addWidget(self.fetch_button)
         layout.addLayout(search)
 
         watchlist_row = QHBoxLayout()
@@ -1094,17 +1092,11 @@ class QuotePanel(QWidget):
                 background: #17283b;
             }
             QLineEdit {
-                color: #e7eef7; background: #101b28; border: 1px solid #32445b;
+                color: #1f2d42; background: #ffffff; border: 1px solid #64748b;
                 border-radius: 10px; padding: 8px 10px; font: 13px "Noto Sans SC";
             }
             QLineEdit:focus { border-color: #4b83e3; }
             QPushButton { font-family: "Noto Sans SC"; cursor: pointer; }
-            QPushButton#fetchButton {
-                color: #ffffff; background: #2467d8; border: 1px solid #397bec; border-radius: 10px;
-                padding: 8px 13px; font-weight: 700;
-            }
-            QPushButton#fetchButton:hover { background: #3278e8; }
-            QPushButton#fetchButton:disabled { background: #26364a; color: #74859b; }
             QPushButton#secondaryButton, QPushButton#headerButton {
                 color: #a8b6c8; background: #101b28; border: 1px solid #32445b;
                 border-radius: 8px; padding: 5px 7px; font-size: 11px;
@@ -1175,11 +1167,6 @@ class QuotePanel(QWidget):
                 color: #1f2d42; background: #ffffff; border-color: #c4d0df;
             }
             QLineEdit:focus { border-color: #5c8dde; }
-            QPushButton#fetchButton {
-                color: #ffffff; background: #2d6ed8; border-color: #2d6ed8;
-            }
-            QPushButton#fetchButton:hover { background: #3b7de7; }
-            QPushButton#fetchButton:disabled { background: #ccd6e3; color: #78879a; }
             QPushButton#secondaryButton, QPushButton#headerButton {
                 color: #40516a; background: #f2f6fa; border-color: #c4d0df;
             }
@@ -1279,6 +1266,17 @@ class QuotePanel(QWidget):
         self._resolved_input_symbol = symbol.code
         parts = [name.strip(), symbol.display_code, symbol.market_label]
         self.symbol_input.setText(" · ".join(part for part in parts if part))
+
+    @Slot(str)
+    def _on_search_text_changed(self, text: str) -> None:
+        if text.strip():
+            return
+        self._search_timer.stop()
+        self._pending_search_text = ""
+        self._resolved_input_symbol = None
+        self._search_display_to_symbol.clear()
+        self._search_model.setStringList([])
+        self.search_completer.popup().hide()
 
     @Slot(str)
     def _schedule_name_search(self, text: str) -> None:
@@ -1529,6 +1527,12 @@ class QuotePanel(QWidget):
             normalize_symbol(code).provider_symbol
             for code in [*self.watchlist, *self.favorite_symbols, *INDEX_SYMBOLS]
         }
+        current_symbol = self._current_input_symbol()
+        if current_symbol:
+            try:
+                active_keys.add(normalize_symbol(current_symbol).provider_symbol)
+            except SymbolError:
+                pass
         for symbol_key in list(self._quote_cache):
             if symbol_key not in active_keys:
                 self._quote_cache.pop(symbol_key, None)
@@ -1798,8 +1802,6 @@ class QuotePanel(QWidget):
             self._show_error("请输入股票代码。")
             return
 
-        self.fetch_button.setDisabled(True)
-        self.fetch_button.setText("拉取中…")
         self.status_label.setText("正在请求最新可用行情…")
         self.loading_changed.emit(True)
 
@@ -1851,8 +1853,6 @@ class QuotePanel(QWidget):
 
     def _finish_loading(self) -> None:
         self._active_task = None
-        self.fetch_button.setDisabled(False)
-        self.fetch_button.setText("拉取行情")
         self.loading_changed.emit(False)
 
     def place_near(self, pet: QWidget) -> None:
