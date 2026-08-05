@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import datetime, timedelta, timezone
 from html import escape
 
 from PySide6.QtCore import QObject, QPoint, QPointF, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
@@ -64,6 +65,8 @@ SKINS: dict[str, tuple[str, str, bool]] = {
     "ella-wave": ("Ella Wave", "skins/ella-wave.webp", True),
     "endminguga": ("GUGUGAGA", "skins/endminguga.webp", True),
     "ikunchick": ("ikunchick", "skins/ikunchick.webp", True),
+    "maid-deepseek-whale": ("DeepSeek 鲸鱼女仆", "skins/maid-deepseek-whale.webp", True),
+    "deepseek": ("DeepSeek 鲸鱼", "skins/deepseek.webp", True),
 }
 DEFAULT_HK_WATCHLIST = ("00700", "01810")
 DEFAULT_A_SHARE_ETFS = ("159516", "515880", "512200", "512800")
@@ -82,8 +85,58 @@ FAVORITE_REFRESH_INTERVAL_MS = 5_000
 OPEN_TAB_REFRESH_INTERVAL_MS = 10_000
 FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
 FAVORITE_BUBBLE_PAGE_SIZE = 5
+MARKET_TIMEZONE = timezone(timedelta(hours=8))
+A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
+HK_MARKETS = {"hk", "hk_index"}
+A_SHARE_SESSIONS = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
+HK_SESSIONS = ((9 * 60 + 30, 12 * 60), (13 * 60, 16 * 60))
 
 _UI_FONTS_LOADED = False
+
+
+def _is_open_for_automatic_refresh(
+    raw_symbol: str,
+    at: datetime | None = None,
+) -> bool:
+    """Return whether a symbol should be polled automatically in China time."""
+    try:
+        market = normalize_symbol(raw_symbol).market
+    except SymbolError:
+        return False
+
+    current = at or datetime.now(MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(MARKET_TIMEZONE)
+
+    if current.weekday() >= 5:
+        return market not in A_SHARE_MARKETS | HK_MARKETS | {"gold"}
+    if market == "gold":
+        return True
+
+    minute = current.hour * 60 + current.minute
+    sessions = (
+        A_SHARE_SESSIONS
+        if market in A_SHARE_MARKETS
+        else HK_SESSIONS if market in HK_MARKETS else ()
+    )
+    if not sessions:
+        return True
+    return any(start <= minute < end for start, end in sessions)
+
+
+def _automatic_refresh_symbols(
+    symbols: list[str] | tuple[str, ...],
+    at: datetime | None = None,
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(symbol)
+            for symbol in symbols
+            if _is_open_for_automatic_refresh(str(symbol), at)
+        )
+    )
 
 
 def _load_ui_fonts() -> None:
@@ -1375,7 +1428,11 @@ class QuotePanel(QWidget):
     def _on_market_tab_changed(self, index: int) -> None:
         self._update_market_summary()
         self._select_first_current_tab_item()
-        self.refresh_current_tab()
+        symbols = self._current_tab_refresh_symbols()
+        if symbols:
+            self.periodic_page_refresh_requested.emit(symbols)
+        if symbols and not _automatic_refresh_symbols(symbols):
+            self.status_label.setText("当前市场已休市，显示最近一次行情")
 
     def _current_tab_list_symbols(self) -> list[str]:
         a_shares, hk_shares = partition_watchlist(self.watchlist)
@@ -1900,12 +1957,14 @@ class StockPetWidget(QWidget):
         self._watch_manual = False
         self._watch_animate = False
         self._pending_page_symbols: list[str] | None = None
+        self._page_refresh_initialized_keys: set[str] = set()
         self._alert_states: dict[str, int] = {}
         self._watch_timer = QTimer(self)
         self._watch_timer.timeout.connect(self.scan_watchlist)
         self._configure_watch_timer()
         self._favorite_task: WatchlistTask | None = None
         self._favorite_refresh_pending = False
+        self._favorite_refresh_initialized_keys: set[str] = set()
         self._favorite_quotes: list[Quote] = []
         self._favorite_index = 0
         self._favorite_refresh_timer = QTimer(self)
@@ -2182,6 +2241,7 @@ class StockPetWidget(QWidget):
         favorite_keys = {
             normalize_symbol(code).provider_symbol for code in self.favorite_symbols
         }
+        self._favorite_refresh_initialized_keys.intersection_update(favorite_keys)
         self._favorite_quotes = [
             quote
             for quote in self._favorite_quotes
@@ -2208,7 +2268,13 @@ class StockPetWidget(QWidget):
             return
         if self._favorite_task is not None:
             return
-        task = WatchlistTask(self.provider, list(self.favorite_symbols))
+        symbols = self._automatic_symbols_with_initialization(
+            self.favorite_symbols,
+            self._favorite_refresh_initialized_keys,
+        )
+        if not symbols:
+            return
+        task = WatchlistTask(self.provider, symbols)
         task.signals.finished.connect(self._on_favorite_result)
         self._favorite_task = task
         QThreadPool.globalInstance().start(task)
@@ -2224,7 +2290,23 @@ class StockPetWidget(QWidget):
             quote for quote in quotes if quote.symbol.provider_symbol in favorite_keys
         ]
         if refreshed_quotes:
-            self._favorite_quotes = refreshed_quotes
+            previous_by_key = {
+                quote.symbol.provider_symbol: quote for quote in self._favorite_quotes
+            }
+            refreshed_by_key = {
+                quote.symbol.provider_symbol: quote for quote in refreshed_quotes
+            }
+            self._favorite_quotes = [
+                quote
+                for code in self.favorite_symbols
+                if (
+                    quote := refreshed_by_key.get(
+                        normalize_symbol(code).provider_symbol,
+                        previous_by_key.get(normalize_symbol(code).provider_symbol),
+                    )
+                )
+                is not None
+            ]
             page_count = self._favorite_page_count()
             self._favorite_index %= page_count
             self.panel.update_watchlist_quotes(refreshed_quotes)
@@ -2255,7 +2337,7 @@ class StockPetWidget(QWidget):
 
     @Slot(object)
     def _apply_quote(self, quote: Quote) -> None:
-        return
+        self._page_refresh_initialized_keys.add(quote.symbol.provider_symbol)
 
     @Slot(str)
     def _apply_bubble_theme(self, theme: str) -> None:
@@ -2297,6 +2379,11 @@ class StockPetWidget(QWidget):
         self.interval_seconds = interval_seconds
         self.alerts_enabled = alerts_enabled
         self._alert_states.clear()
+        active_keys = {
+            normalize_symbol(code).provider_symbol
+            for code in [*self.watchlist, *INDEX_SYMBOLS]
+        }
+        self._page_refresh_initialized_keys.intersection_update(active_keys)
         self._configure_watch_timer()
         if alerts_enabled and watchlist:
             self.scan_watchlist()
@@ -2331,7 +2418,15 @@ class StockPetWidget(QWidget):
         self._start_quote_batch(symbols, manual=False, animate=False)
 
     def _start_quote_batch(self, symbols: list[str], manual: bool, animate: bool) -> None:
-        task = WatchlistTask(self.provider, symbols)
+        request_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols))
+        if not manual:
+            request_symbols = self._automatic_symbols_with_initialization(
+                request_symbols,
+                self._page_refresh_initialized_keys,
+            )
+        if not request_symbols:
+            return
+        task = WatchlistTask(self.provider, request_symbols)
         task.signals.finished.connect(self._on_watchlist_result)
         self._watch_task = task
         self._watch_manual = manual
@@ -2339,8 +2434,25 @@ class StockPetWidget(QWidget):
         if animate:
             self._set_refresh_activity("page", True)
         if manual:
-            self.panel.status_label.setText(f"正在刷新当前页的 {len(symbols)} 项行情…")
+            self.panel.status_label.setText(f"正在刷新当前页的 {len(request_symbols)} 项行情…")
         QThreadPool.globalInstance().start(task)
+
+    @staticmethod
+    def _automatic_symbols_with_initialization(
+        symbols: list[str] | tuple[str, ...],
+        initialized_keys: set[str],
+    ) -> list[str]:
+        request_symbols: list[str] = []
+        for raw_symbol in dict.fromkeys(str(symbol) for symbol in symbols):
+            try:
+                key = normalize_symbol(raw_symbol).provider_symbol
+            except SymbolError:
+                continue
+            if key in initialized_keys and not _is_open_for_automatic_refresh(raw_symbol):
+                continue
+            initialized_keys.add(key)
+            request_symbols.append(raw_symbol)
+        return request_symbols
 
     @Slot(object)
     def _on_watchlist_result(self, result: tuple[list[Quote], list[str]]) -> None:
@@ -2352,6 +2464,9 @@ class StockPetWidget(QWidget):
         self._watch_animate = False
         if animate:
             self._set_refresh_activity("page", False)
+        self._page_refresh_initialized_keys.update(
+            quote.symbol.provider_symbol for quote in quotes
+        )
         self.panel.update_watchlist_quotes(quotes)
 
         if manual:
