@@ -1,0 +1,81 @@
+name: Release Windows app
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read and verify version
+        id: version
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          $sourceVersion = python -c "from stock_pet import __version__; print(__version__)"
+          if ($tagVersion -ne $sourceVersion) {
+            throw "Tag version $tagVersion does not match source version $sourceVersion"
+          }
+          "value=$tagVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Build PyInstaller directory
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Install Velopack CLI
+        shell: pwsh
+        run: dotnet tool install --tool-path .\.tools vpk --version 1.2.0
+
+      - name: Download previous Velopack release
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          .\.tools\vpk.exe download github
+          --repoUrl https://github.com/${{ github.repository }}
+          --token $env:GITHUB_TOKEN
+          --outputDir Releases
+
+      - name: Create installer and update packages
+        shell: pwsh
+        run: >-
+          .\.tools\vpk.exe pack
+          --packId NeoRrrr.StockDeskPet
+          --packVersion ${{ steps.version.outputs.value }}
+          --packDir dist\StockDeskPet
+          --mainExe StockDeskPet.exe
+          --packTitle "股票桌宠"
+          --packAuthors NeoRrrr
+          --outputDir Releases
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          .\.tools\vpk.exe upload github
+          --repoUrl https://github.com/${{ github.repository }}
+          --token $env:GITHUB_TOKEN
+          --outputDir Releases
+          --publish
+          --releaseName "股票桌宠 v${{ steps.version.outputs.value }}"
+          --tag "v${{ steps.version.outputs.value }}"
+          --targetCommitish "${{ github.sha }}"

@@ -3,11 +3,12 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton, QSlider
 
 from stock_pet import __version__
 from stock_pet.models import Quote
@@ -16,7 +17,10 @@ from stock_pet.symbols import normalize_symbol
 from stock_pet.ui import (
     DEFAULT_A_SHARE_ETFS,
     DEFAULT_HK_WATCHLIST,
+    FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
+    FAVORITE_REFRESH_INTERVAL_MS,
     INDEX_SYMBOLS,
+    OPEN_TAB_REFRESH_INTERVAL_MS,
     SPRITE_ANIMATIONS,
     TAB_MARKET_SUMMARIES,
     QuotePanel,
@@ -38,9 +42,17 @@ class QuotePanelTests(unittest.TestCase):
             settings.setValue("watchlist", [*DEFAULT_A_SHARE_ETFS, *DEFAULT_HK_WATCHLIST])
             panel = QuotePanel(TencentQuoteProvider(), settings)
             captured: list[list[str]] = []
+            periodic: list[list[str]] = []
             panel.page_refresh_requested.connect(lambda symbols: captured.append(list(symbols)))
+            panel.periodic_page_refresh_requested.connect(
+                lambda symbols: periodic.append(list(symbols))
+            )
             panel.show()
             self.app.processEvents()
+            self.assertTrue(panel._open_tab_refresh_timer.isActive())
+            self.assertEqual(
+                panel._open_tab_refresh_timer.interval(), OPEN_TAB_REFRESH_INTERVAL_MS
+            )
 
             tab_bar = panel.market_tabs.tabBar()
             tab_widths = [tab_bar.tabRect(index).width() for index in range(tab_bar.count())]
@@ -68,6 +80,8 @@ class QuotePanelTests(unittest.TestCase):
                 panel.index_list.currentItem().data(Qt.ItemDataRole.UserRole),
                 INDEX_SYMBOLS[0],
             )
+            panel._refresh_open_tab()
+            self.assertEqual(periodic[-1], list(INDEX_SYMBOLS))
             self.assertTrue(panel.market_summary_frame.isHidden())
             button_texts = {button.text() for button in panel.findChildren(QPushButton)}
             self.assertIn("刷新当前页", button_texts)
@@ -88,6 +102,9 @@ class QuotePanelTests(unittest.TestCase):
             self.assertEqual(settings.value("theme"), "beige")
             self.assertTrue(panel.theme_switch.isChecked())
             self.assertEqual(theme_changes, ["beige"])
+            panel.hide()
+            self.app.processEvents()
+            self.assertFalse(panel._open_tab_refresh_timer.isActive())
             panel.close()
 
     def test_main_price_uses_market_direction_color(self) -> None:
@@ -128,6 +145,121 @@ class QuotePanelTests(unittest.TestCase):
             self.assertEqual(panel.price_label.styleSheet(), panel.change_label.styleSheet())
             panel.close()
 
+    def test_item_favorite_button_and_panel_opacity_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            settings.setValue("watchlist", [*DEFAULT_A_SHARE_ETFS, *DEFAULT_HK_WATCHLIST])
+            settings.setValue("favorites", [DEFAULT_A_SHARE_ETFS[0], "HSI"])
+            settings.setValue("panel_opacity", 72)
+            panel = QuotePanel(TencentQuoteProvider(), settings)
+            panel.show()
+            self.app.processEvents()
+
+            self.assertIsInstance(panel.opacity_slider, QSlider)
+            self.assertEqual((panel.opacity_slider.minimum(), panel.opacity_slider.maximum()), (90, 100))
+            self.assertEqual(panel.opacity_slider.value(), 90)
+            self.assertAlmostEqual(panel.windowOpacity(), 0.90, places=2)
+            panel.set_panel_opacity(1)
+            self.assertEqual(panel.opacity_value_label.text(), "90%")
+            self.assertEqual(int(settings.value("panel_opacity")), 90)
+
+            first_item = panel.a_share_list.item(0)
+            first_row = panel.a_share_list.itemWidget(first_item)
+            favorite_button = first_row.findChild(QPushButton, "favoriteButton")
+            self.assertIsNotNone(favorite_button)
+            self.assertTrue(favorite_button.isChecked())
+
+            changes: list[list[str]] = []
+            panel.favorites_changed.connect(lambda favorites: changes.append(list(favorites)))
+            favorite_button.click()
+            self.app.processEvents()
+            self.assertNotIn(DEFAULT_A_SHARE_ETFS[0], panel.favorite_symbols)
+            self.assertEqual(changes[-1], ["HSI"])
+
+            index_item = panel.index_list.item(1)
+            index_row = panel.index_list.itemWidget(index_item)
+            index_button = index_row.findChild(QPushButton, "favoriteButton")
+            self.assertTrue(index_button.isChecked())
+            panel.close()
+
+    def test_favorite_quotes_rotate_in_large_idle_bubble(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            favorite_symbols = ["159516", "515880", "512200", "512800", "600519", "00700"]
+            settings.setValue("favorites", favorite_symbols)
+            pet = StockPetWidget(settings)
+            pet._animation.stop()
+            pet._watch_timer.stop()
+            self.assertEqual(pet._favorite_refresh_timer.interval(), FAVORITE_REFRESH_INTERVAL_MS)
+            pet._favorite_refresh_timer.stop()
+            pet._favorite_carousel_timer.stop()
+
+            def quote(raw_symbol: str, name: str, change_percent: float) -> Quote:
+                return Quote(
+                    symbol=normalize_symbol(raw_symbol),
+                    name=name,
+                    price=10.5,
+                    previous_close=10.0,
+                    open_price=10.0,
+                    high=10.8,
+                    low=9.9,
+                    change=0.5,
+                    change_percent=change_percent,
+                    volume=1.0,
+                    volume_unit="手",
+                    amount=1.0,
+                    quote_time="2026-08-05 13:45:00",
+                    source="测试行情",
+                )
+
+            quotes = [
+                quote(raw_symbol, f"收藏行情{index}", 2.5 if index % 2 else -1.2)
+                for index, raw_symbol in enumerate(favorite_symbols, start=1)
+            ]
+            pet._on_favorite_result((quotes, []))
+            self.assertGreaterEqual(pet.bubble.width(), 280)
+            for index in range(1, 6):
+                self.assertIn(f"收藏行情{index}", pet.bubble.text())
+            self.assertNotIn("收藏行情6", pet.bubble.text())
+            self.assertEqual(
+                pet._favorite_carousel_timer.interval(),
+                FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
+            )
+            self.assertTrue(pet._favorite_carousel_timer.isActive())
+            pet._show_next_favorite()
+            self.assertIn("收藏行情6", pet.bubble.text())
+            pet._favorite_carousel_timer.stop()
+            pet.panel.close()
+            pet.close()
+
+    def test_automatic_refreshes_do_not_trigger_refresh_animation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            settings.setValue("favorites", ["159516"])
+            pet = StockPetWidget(settings)
+            pet._animation.stop()
+            pet._watch_timer.stop()
+            pet._favorite_refresh_timer.stop()
+            pet._favorite_carousel_timer.stop()
+
+            with patch("stock_pet.ui.QThreadPool.globalInstance") as pool:
+                pet.refresh_favorites()
+                self.assertEqual(pet._refresh_activity_sources, set())
+                pet.scan_watchlist()
+                self.assertEqual(pet._refresh_activity_sources, set())
+                self.assertEqual(pool.return_value.start.call_count, 2)
+
+            pet._favorite_task = None
+            pet._watch_task = None
+            pet.panel.close()
+            pet.close()
+
     def test_codexpet_skin_uses_distinct_interaction_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
@@ -137,6 +269,8 @@ class QuotePanelTests(unittest.TestCase):
             pet = StockPetWidget(settings)
             pet._animation.stop()
             pet._watch_timer.stop()
+            pet._favorite_refresh_timer.stop()
+            pet._favorite_carousel_timer.stop()
 
             self.assertEqual(pet.current_skin, "ikunchick")
             self.assertEqual(pet._skin_animation, "idle")

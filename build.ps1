@@ -1,3 +1,8 @@
+param(
+    [switch]$Package,
+    [string]$Version = ""
+)
+
 $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $ProjectDir '.venv\Scripts\python.exe'
@@ -14,7 +19,7 @@ try {
     & $Python -m PyInstaller `
         --noconfirm `
         --clean `
-        --onefile `
+        --onedir `
         --windowed `
         --name StockDeskPet `
         --add-data 'assets;assets' `
@@ -24,5 +29,22 @@ finally {
     Pop-Location
 }
 
-Write-Host "Build complete: $ProjectDir\dist\StockDeskPet.exe"
+Write-Host "Build complete: $ProjectDir\dist\StockDeskPet\StockDeskPet.exe"
 
+if ($Package) {
+    if (-not $Version) {
+        $Version = & $Python -c "from stock_pet import __version__; print(__version__)"
+    }
+    if (-not (Get-Command vpk -ErrorAction SilentlyContinue)) {
+        dotnet tool install -g vpk --version 1.2.0
+    }
+    & vpk pack `
+        --packId NeoRrrr.StockDeskPet `
+        --packVersion $Version `
+        --packDir (Join-Path $ProjectDir 'dist\StockDeskPet') `
+        --mainExe StockDeskPet.exe `
+        --packTitle '股票桌宠' `
+        --packAuthors NeoRrrr `
+        --outputDir (Join-Path $ProjectDir 'Releases')
+    Write-Host "Velopack package complete: $ProjectDir\Releases"
+}

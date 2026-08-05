@@ -4,6 +4,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import velopack
 from PySide6.QtCore import QLockFile
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
@@ -14,6 +15,9 @@ from stock_pet.ui import StockPetWidget
 
 
 def main() -> int:
+    # Velopack must process install/update hooks before normal application startup.
+    velopack.App().run()
+
     app = QApplication(sys.argv)
     app.setApplicationName("StockDeskPet")
     app.setApplicationVersion(__version__)

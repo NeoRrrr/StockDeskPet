@@ -4,9 +4,10 @@ import argparse
 import re
 from collections.abc import Callable
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
-from .models import Quote, StockSymbol
+from .models import Quote, StockSearchResult, StockSymbol
 from .symbols import SymbolError, normalize_symbol
 
 
@@ -25,6 +26,7 @@ class TencentQuoteProvider:
     """
 
     endpoint = "https://qt.gtimg.cn/q={symbol}"
+    search_endpoint = "https://smartbox.gtimg.cn/s3/?q={query}&t=all"
 
     def __init__(self, transport: Transport | None = None, timeout: float = 8.0) -> None:
         self._transport = transport or self._download
@@ -43,6 +45,17 @@ class TencentQuoteProvider:
             raise QuoteError(f"行情网络请求失败：{exc}") from exc
         return parse_tencent_payload(payload, symbol)
 
+    def search(self, query: str, limit: int = 8) -> list[StockSearchResult]:
+        keyword = (query or "").strip()
+        if not keyword:
+            return []
+        url = self.search_endpoint.format(query=quote_plus(keyword))
+        try:
+            payload = self._transport(url).decode("utf-8", errors="replace")
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise QuoteError(f"股票名称搜索失败：{exc}") from exc
+        return parse_tencent_search_payload(payload, limit=limit)
+
     def _download(self, url: str) -> bytes:
         request = Request(
             url,
@@ -54,6 +67,40 @@ class TencentQuoteProvider:
         )
         with urlopen(request, timeout=self.timeout) as response:
             return response.read()
+
+
+def parse_tencent_search_payload(payload: str, limit: int = 8) -> list[StockSearchResult]:
+    match = re.search(r'v_hint\s*=\s*"([^"]*)"', payload)
+    if not match or not match.group(1):
+        return []
+    value = re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda item: chr(int(item.group(1), 16)),
+        match.group(1),
+    )
+    results: list[StockSearchResult] = []
+    seen: set[str] = set()
+    for raw_item in value.split("^"):
+        fields = raw_item.split("~")
+        if len(fields) < 5:
+            continue
+        market, code, name, _pinyin, security_type = fields[:5]
+        market = market.lower()
+        if market not in {"hk", "sh", "sz", "bj"}:
+            continue
+        if not (security_type.startswith("GP") or security_type == "ETF"):
+            continue
+        try:
+            symbol = normalize_symbol(f"{market}{code}")
+        except SymbolError:
+            continue
+        if symbol.provider_symbol in seen:
+            continue
+        seen.add(symbol.provider_symbol)
+        results.append(StockSearchResult(symbol=symbol, name=name.strip()))
+        if len(results) >= max(1, limit):
+            break
+    return results
 
 
 def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
