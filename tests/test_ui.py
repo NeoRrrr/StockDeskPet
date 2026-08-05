@@ -130,11 +130,13 @@ class QuotePanelTests(unittest.TestCase):
                     amount=1.0,
                     quote_time="2026-08-05 13:45:00",
                     source="测试行情",
+                    turnover_rate=16.18,
                 )
 
             panel._display_quote(quote(9.69))
             self.assertIn(panel._up_color(), panel.price_label.styleSheet())
             self.assertEqual(panel.price_label.styleSheet(), panel.change_label.styleSheet())
+            self.assertIn("换手 16.18%", panel.details_label.text())
 
             panel._display_quote(quote(-2.35))
             self.assertIn(panel._down_color(), panel.price_label.styleSheet())

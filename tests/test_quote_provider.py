@@ -25,12 +25,14 @@ class QuoteParserTests(unittest.TestCase):
         fields[34] = "482.200"
         fields[36] = "9558538"
         fields[37] = "4686033857.909"
+        fields[59] = "0.28"
 
         quote = parse_tencent_payload(payload(fields, "hk00700"), normalize_symbol("00700"))
         self.assertEqual(quote.name, "腾讯控股")
         self.assertEqual(quote.price, 494.8)
         self.assertEqual(quote.change_percent, 1.48)
         self.assertEqual(quote.volume_unit, "股")
+        self.assertEqual(quote.turnover_rate, 0.28)
         self.assertEqual(quote.quote_time, "2026-08-05 10:35:20")
 
     def test_parse_a_share_quote(self) -> None:
@@ -46,11 +48,13 @@ class QuoteParserTests(unittest.TestCase):
         fields[33] = "1333.80"
         fields[34] = "1309.00"
         fields[36] = "19201"
+        fields[38] = "0.34"
         fields[57] = "252959.5252"
 
         quote = parse_tencent_payload(payload(fields, "sh600519"), normalize_symbol("600519"))
         self.assertEqual(quote.volume_unit, "手")
         self.assertAlmostEqual(quote.amount, 2_529_595_252.0)
+        self.assertEqual(quote.turnover_rate, 0.34)
         self.assertEqual(quote.quote_time, "2026-08-05 10:50:26")
         self.assertEqual(quote.direction, -1)
 
@@ -68,6 +72,7 @@ class QuoteParserTests(unittest.TestCase):
         self.assertEqual(quote.price, 4130.63)
         self.assertAlmostEqual(quote.change_percent, 1.31)
         self.assertEqual(quote.symbol.currency, "USD")
+        self.assertIsNone(quote.turnover_rate)
         self.assertEqual(quote.quote_time, "2026-08-05 11:29:00")
 
 

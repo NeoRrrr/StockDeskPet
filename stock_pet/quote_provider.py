@@ -132,10 +132,12 @@ def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
         volume = _number(fields, 36, _number(fields, 6))
         volume_unit = "股"
         amount = _number(fields, 37)
+        turnover_rate = _optional_number(fields, 59)
     else:
         volume = _number(fields, 36, _number(fields, 6))
         volume_unit = "手"
         amount = _number(fields, 57, _number(fields, 37)) * 10_000.0
+        turnover_rate = _optional_number(fields, 38)
 
     return Quote(
         symbol=symbol,
@@ -152,6 +154,7 @@ def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
         amount=amount,
         quote_time=_normalize_time(fields[30].strip()),
         source="腾讯行情（公共网页接口）",
+        turnover_rate=turnover_rate,
     )
 
 
@@ -195,6 +198,18 @@ def _number(fields: list[str], index: int, default: float = 0.0) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _optional_number(fields: list[str], index: int) -> float | None:
+    if index >= len(fields):
+        return None
+    value = fields[index].strip().replace(",", "")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _normalize_time(value: str) -> str:

@@ -1027,7 +1027,7 @@ class QuotePanel(QWidget):
         layout.addWidget(self.name_label)
         layout.addLayout(price_row)
 
-        self.details_label = QLabel("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
+        self.details_label = QLabel("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
         self.details_label.setObjectName("details")
         layout.addWidget(self.details_label)
         layout.addStretch()
@@ -1481,7 +1481,7 @@ class QuotePanel(QWidget):
         self.price_label.setStyleSheet("")
         self.change_label.setText("")
         self.change_label.setStyleSheet("")
-        self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
+        self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
         self.status_label.setText("点击自选列表或输入代码/名称拉取行情；行情可能延迟，仅供参考")
 
     def _current_stock_list(self) -> QListWidget | None:
@@ -1513,7 +1513,7 @@ class QuotePanel(QWidget):
                 self.price_label.setStyleSheet("")
                 self.change_label.setText("")
                 self.change_label.setStyleSheet("")
-                self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
+                self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
             return
         self._clear_quote_display()
 
@@ -1891,9 +1891,11 @@ class QuotePanel(QWidget):
                 f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}    单位 {unit}"
             )
         else:
+            turnover = "--" if quote.turnover_rate is None else f"{quote.turnover_rate:.2f}%"
             self.details_label.setText(
                 f"今开 {_price(quote.open_price)}    最高 {_price(quote.high)}    最低 {_price(quote.low)}\n"
-                f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}    成交额 {_human_money(quote.amount)}"
+                f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}\n"
+                f"成交额 {_human_money(quote.amount)}    换手 {turnover}"
             )
         self.status_label.setText(f"{quote.source} · {quote.quote_time}\n行情可能延迟，仅供参考，不作为交易依据")
         self.quote_loaded.emit(quote)

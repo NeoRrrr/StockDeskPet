@@ -37,6 +37,7 @@ class Quote:
     amount: float
     quote_time: str
     source: str
+    turnover_rate: float | None = None
 
     @property
     def direction(self) -> int:
