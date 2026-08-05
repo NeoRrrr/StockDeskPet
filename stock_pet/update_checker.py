@@ -12,6 +12,7 @@ import velopack
 
 LATEST_RELEASE_URL = "https://github.com/NeoRrrr/StockDeskPet/releases/latest"
 PROJECT_URL = "https://github.com/NeoRrrr/StockDeskPet"
+UPDATE_BASE_URL = f"{PROJECT_URL}/releases/latest/download"
 
 
 class UpdateCheckError(RuntimeError):
@@ -54,7 +55,10 @@ def check_download_and_install(
     progress = progress_callback or (lambda _value: None)
     phase("正在检查 GitHub Releases…")
 
-    source = velopack.GithubSource(PROJECT_URL, access_token=None, prerelease=False)
+    # GitHub's public API is limited to 60 anonymous requests per shared IP.
+    # The latest-release download endpoint is a static redirect and therefore
+    # keeps one-click updates working without embedding a user or app token.
+    source = velopack.HttpSource(UPDATE_BASE_URL)
     try:
         manager = velopack.UpdateManager(source)
         installed_version = manager.get_current_version().lstrip("vV")
