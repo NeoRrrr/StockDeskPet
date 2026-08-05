@@ -4,8 +4,8 @@ import math
 import os
 from html import escape
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QPointF, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -228,6 +228,77 @@ class QuoteItemDelegate(QStyledItemDelegate):
             option.palette.setColor(QPalette.ColorRole.HighlightedText, foreground)
 
 
+class FavoriteButton(QAbstractButton):
+    """A consistent vector star that does not depend on platform emoji fonts."""
+
+    def __init__(
+        self,
+        favorite: bool,
+        theme: str,
+        *,
+        compact: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.theme = theme
+        self._hovered = False
+        self.setObjectName("favoriteButton")
+        self.setCheckable(True)
+        self.setChecked(favorite)
+        self.setFixedSize(20 if compact else 24, 18 if compact else 24)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        is_light = self.theme == "beige"
+
+        if self._hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#e7effa" if is_light else "#203249"))
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+
+        checked = self.isChecked()
+        if checked:
+            star_color = QColor("#d69218" if is_light else "#f0b83f")
+        elif self._hovered:
+            star_color = QColor("#2d6ed8" if is_light else "#dbe8f8")
+        else:
+            star_color = QColor("#8191a7" if is_light else "#8193aa")
+
+        center = QPointF(self.width() / 2.0, self.height() / 2.0 - 0.6)
+        target_radius = 6.1 if self.width() >= 24 else 5.3
+        outer_radius = min(target_radius, max(4.2, (self.height() - 4.0) / 2.0))
+        inner_radius = outer_radius * 0.45
+        star = QPainterPath()
+        for index in range(10):
+            radius = outer_radius if index % 2 == 0 else inner_radius
+            angle = -math.pi / 2.0 + index * math.pi / 5.0
+            point = QPointF(
+                center.x() + math.cos(angle) * radius,
+                center.y() + math.sin(angle) * radius,
+            )
+            if index == 0:
+                star.moveTo(point)
+            else:
+                star.lineTo(point)
+        star.closeSubpath()
+
+        painter.setPen(QPen(star_color, 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(star_color if checked else Qt.BrushStyle.NoBrush)
+        painter.drawPath(star)
+
+
 class QuoteRowWidget(QWidget):
     """Quote text plus a compact favorite button for a single list item."""
 
@@ -242,6 +313,7 @@ class QuoteRowWidget(QWidget):
         favorite: bool,
         *,
         compact: bool = False,
+        theme: str = "dark",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -258,12 +330,7 @@ class QuoteRowWidget(QWidget):
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(self.text_label, 1)
 
-        self.favorite_button = QPushButton("★" if favorite else "☆")
-        self.favorite_button.setObjectName("favoriteButton")
-        self.favorite_button.setCheckable(True)
-        self.favorite_button.setChecked(favorite)
-        self.favorite_button.setFixedSize(20 if compact else 24, 18 if compact else 24)
-        self.favorite_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.favorite_button = FavoriteButton(favorite, theme, compact=compact)
         self.favorite_button.setToolTip("取消收藏" if favorite else "收藏到桌宠气泡")
         self.favorite_button.setAccessibleName(self.favorite_button.toolTip())
         self.favorite_button.clicked.connect(self._toggle_favorite)
@@ -271,7 +338,6 @@ class QuoteRowWidget(QWidget):
 
     @Slot(bool)
     def _toggle_favorite(self, favorite: bool) -> None:
-        self.favorite_button.setText("★" if favorite else "☆")
         self.favorite_button.setToolTip("取消收藏" if favorite else "收藏到桌宠气泡")
         self.favorite_button.setAccessibleName(self.favorite_button.toolTip())
         self.favorite_toggled.emit(self.symbol)
@@ -981,21 +1047,24 @@ class QuotePanel(QWidget):
             QLabel#monitor { color: #7f90a5; font-size: 10px; }
             QLabel#opacityLabel, QLabel#opacityValue { color: #7f90a5; font-size: 10px; }
             QTabWidget#marketTabs::pane {
-                background: #101b28; border: 1px solid #304158;
-                border-radius: 10px; top: -1px;
+                background: #101b28; border: 1px solid #364a63; border-top: none;
+                border-radius: 0; top: 0;
             }
             QTabBar::tab {
-                color: #9aaabd; background: #0e1824; border: 1px solid #304158;
+                color: #9aaabd; background: #0e1824; border: 1px solid #364a63;
+                border-right: none; margin: 0;
                 padding: 7px 12px; min-width: 60px;
                 font: 600 12px "Noto Sans SC";
             }
             QTabBar::tab:first { border-top-left-radius: 8px; }
-            QTabBar::tab:last { border-top-right-radius: 8px; }
+            QTabBar::tab:last { border-right: 1px solid #364a63; border-top-right-radius: 8px; }
             QTabBar::tab:selected {
                 color: #ffffff; background: #2464d3; border-color: #3678e7;
+                border-right: 1px solid #3678e7;
             }
             QListWidget#stockList, QListWidget#indexList {
                 color: #cbd5e1; background: #101b28; border: none;
+                border-radius: 0;
                 outline: none; padding: 0; font: 12px "Noto Sans SC";
             }
             QListWidget#stockList::item {
@@ -1010,12 +1079,7 @@ class QuotePanel(QWidget):
             QLabel#quoteRowText {
                 background: transparent; border: none; font: 12px "Noto Sans SC";
             }
-            QPushButton#favoriteButton {
-                color: #78899e; background: transparent; border: none;
-                border-radius: 6px; padding: 0; font-size: 17px;
-            }
-            QPushButton#favoriteButton:hover { color: #edf4ff; background: #21344a; }
-            QPushButton#favoriteButton:checked { color: #f2ba3f; }
+            QAbstractButton#favoriteButton { background: transparent; border: none; padding: 0; }
             QListWidget#indexList { font-size: 11px; }
             QListWidget#indexList::item {
                 border: none; border-bottom: 1px solid #2f4055;
@@ -1085,16 +1149,17 @@ class QuotePanel(QWidget):
             QLabel#status, QLabel#monitor, QLabel#opacityLabel, QLabel#opacityValue { color: #6d7d91; }
             QLabel#footerVersion { color: #8896a8; }
             QTabWidget#marketTabs::pane {
-                background: #f8fafc; border-color: #c4d0df;
+                background: #ffffff; border-color: #aebed2;
             }
             QTabBar::tab {
-                color: #56667c; background: #eef3f8; border-color: #c4d0df;
+                color: #4f6178; background: #edf2f7; border-color: #b8c7d8;
             }
+            QTabBar::tab:last { border-right-color: #b8c7d8; }
             QTabBar::tab:selected {
                 color: #ffffff; background: #2d6ed8; border-color: #2d6ed8;
             }
             QListWidget#stockList, QListWidget#indexList {
-                color: #26364b; background: #f8fafc;
+                color: #26364b; background: #ffffff;
             }
             QListWidget#stockList::item, QListWidget#indexList::item {
                 border-bottom-color: #d5dee9;
@@ -1106,9 +1171,6 @@ class QuotePanel(QWidget):
             QListWidget#stockList::item:selected, QListWidget#indexList::item:selected {
                 background: #e3edfc;
             }
-            QPushButton#favoriteButton { color: #718096; }
-            QPushButton#favoriteButton:hover { color: #1e56af; background: #dce8f8; }
-            QPushButton#favoriteButton:checked { color: #d89516; }
             QLineEdit {
                 color: #1f2d42; background: #ffffff; border-color: #c4d0df;
             }
@@ -1576,7 +1638,14 @@ class QuotePanel(QWidget):
         *,
         compact: bool = False,
     ) -> None:
-        row = QuoteRowWidget(text, symbol, color, favorite, compact=compact)
+        row = QuoteRowWidget(
+            text,
+            symbol,
+            color,
+            favorite,
+            compact=compact,
+            theme=self.current_theme,
+        )
         row.quote_requested.connect(
             lambda raw_symbol, target_list=stock_list, target_item=item: self._open_quote_row(
                 target_list, target_item, raw_symbol
