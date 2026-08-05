@@ -1,5 +1,7 @@
 # 股票桌宠 StockDeskPet
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Windows 股票桌宠 MVP：点击桌宠显示或隐藏行情卡。支持港股、沪市、深市，并预留北交所代码识别。
 
 ## 当前功能
@@ -105,3 +107,9 @@ python -m unittest discover -s tests -v
 ## 素材
 
 默认牛、熊和涨跌图标来自 Microsoft Fluent UI Emoji GitHub 仓库；五套本机皮肤来自 CodexPet.xyz。来源、许可说明和文件哈希见 `THIRD_PARTY_NOTICES.md` 与 `assets/skins/README.md`。
+
+## 许可证
+
+本项目原创源代码采用 [MIT License](LICENSE)。Microsoft 素材和 CodexPet.xyz
+社区皮肤等第三方资产不包含在本项目的 MIT 授权范围内，仍分别受其原始许可和
+授权条款约束，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

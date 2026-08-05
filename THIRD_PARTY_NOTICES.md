@@ -1,5 +1,9 @@
 # Third-party notices
 
+The original StockDeskPet source code is available under the MIT License in
+`LICENSE`. The third-party files listed below are excluded from that project
+license and remain subject to their respective upstream licenses or permissions.
+
 ## Microsoft Fluent UI Emoji
 
 - Source: https://github.com/microsoft/fluentui-emoji
