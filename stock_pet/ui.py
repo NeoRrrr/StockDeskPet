@@ -2019,7 +2019,7 @@ class StockPetWidget(QWidget):
             self.move(screen.right() - self.width() - 24, screen.bottom() - self.height() - 24)
 
         self.setCursor(QCursor(Qt.PointingHandCursor))
-        self.setToolTip("单击刷新当前行情页；拖动可移动；右键切换皮肤")
+        self.setToolTip("单击显示或隐藏行情卡；拖动可移动；右键切换皮肤")
         if self.favorite_symbols:
             QTimer.singleShot(1_000, self.refresh_favorites)
         QTimer.singleShot(5_000, self.scan_watchlist)
@@ -2545,7 +2545,7 @@ class StockPetWidget(QWidget):
             else:
                 next_animation = "refresh" if self._refresh_activity_sources else "idle"
                 self._play_skin_animation("click", restart=True, after_once=next_animation)
-                self.show_and_refresh()
+                self.toggle_panel()
             self._press_global = None
             self._press_window = None
             self._dragging = False
@@ -2582,6 +2582,13 @@ class StockPetWidget(QWidget):
         self.panel.show()
         self.panel.raise_()
         self.panel.activateWindow()
+
+    @Slot()
+    def toggle_panel(self) -> None:
+        if self.panel.isVisible():
+            self.panel.hide()
+        else:
+            self.show_panel()
 
     @Slot()
     def show_and_refresh(self) -> None:
