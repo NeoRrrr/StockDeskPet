@@ -22,7 +22,8 @@ Windows 股票桌宠 MVP：点击桌宠立即刷新当前行情页。支持港�
 - 港股示例：`00700`、`700`、`HK00700`、`0700.HK`
 - A 股示例：`600519`、`SH600519`、`600519.SS`、`000001`、`SZ000001`
 - 行情涨跌不会自动更换皮肤；中国市场配色为红涨绿跌
-- 右键桌宠可在默认牛、Ella Wave、GUGUGAGA 之间切换，选择会自动保存
+- 右键桌宠可在默认牛、Ella Wave、GUGUGAGA、ikunchick 之间切换，选择会自动保存
+- CodexPet 图集皮肤支持状态动画：待机、刷新（含定时拉取）、左右拖拽和点击挥手
 - 系统托盘支持显示、刷新、隐藏、退出
 
 ## 自选股与提醒
@@ -85,4 +86,4 @@ python -m unittest discover -s tests -v
 
 ## 素材
 
-默认牛、熊和涨跌图标来自 Microsoft Fluent UI Emoji GitHub 仓库；两套本机皮肤来自 CodexPet.xyz。来源、许可说明和文件哈希见 `THIRD_PARTY_NOTICES.md` 与 `assets/skins/README.md`。
+默认牛、熊和涨跌图标来自 Microsoft Fluent UI Emoji GitHub 仓库；三套本机皮肤来自 CodexPet.xyz。来源、许可说明和文件哈希见 `THIRD_PARTY_NOTICES.md` 与 `assets/skins/README.md`。

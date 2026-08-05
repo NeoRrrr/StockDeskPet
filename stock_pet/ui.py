@@ -5,11 +5,11 @@ import os
 
 from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QFontDatabase, QMouseEvent, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from .models import Quote
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
@@ -38,11 +40,23 @@ from .symbols import SymbolError, normalize_symbol, normalize_watchlist, partiti
 
 SPRITE_CELL_WIDTH = 192
 SPRITE_CELL_HEIGHT = 208
-SPRITE_IDLE_FRAMES = 6
+SPRITE_FRAME_TICKS = 4
+SPRITE_ANIMATIONS: dict[str, tuple[int, int, bool]] = {
+    "idle": (0, 6, True),
+    "drag_right": (1, 8, True),
+    "drag_left": (2, 8, True),
+    "click": (3, 4, False),
+    "jump": (4, 5, False),
+    "failed": (5, 8, False),
+    "waiting": (6, 6, True),
+    "refresh": (7, 6, True),
+    "review": (8, 6, False),
+}
 SKINS: dict[str, tuple[str, str, bool]] = {
     "default": ("默认牛", "ox_3d.png", False),
     "ella-wave": ("Ella Wave", "skins/ella-wave.webp", True),
     "endminguga": ("GUGUGAGA", "skins/endminguga.webp", True),
+    "ikunchick": ("ikunchick", "skins/ikunchick.webp", True),
 }
 DEFAULT_HK_WATCHLIST = ("00700", "01810")
 DEFAULT_A_SHARE_ETFS = ("159516", "515880", "512200", "512800")
@@ -145,21 +159,6 @@ class QuoteItemDelegate(QStyledItemDelegate):
             option.palette.setColor(QPalette.ColorRole.HighlightedText, foreground)
 
 
-class ChevronComboBox(QComboBox):
-    """Editable quote selector with a restrained, theme-aware chevron."""
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = QColor("#7d5732" if self.property("lightTheme") else "#d0b58f")
-        painter.setPen(QPen(color, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        center_x = self.width() - 18
-        center_y = self.height() // 2
-        painter.drawLine(center_x - 4, center_y - 2, center_x, center_y + 2)
-        painter.drawLine(center_x, center_y + 2, center_x + 4, center_y - 2)
-
-
 class EqualWidthTabWidget(QTabWidget):
     """Keep the three market tabs aligned to the full list width."""
 
@@ -174,31 +173,54 @@ class EqualWidthTabWidget(QTabWidget):
 
 
 class ThemeSwitch(QAbstractButton):
-    """Compact two-position switch: left is dark, right is light."""
+    """Two-position switch with explicit sun and moon mode cues."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setCheckable(True)
-        self.setFixedSize(48, 26)
+        self.setFixedSize(86, 28)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setAccessibleName("切换深浅主题")
+        self.setAccessibleDescription("左侧太阳代表浅色主题，右侧月亮代表深色主题")
+        self._sun_icon = QSvgRenderer(str(asset_path("icons/weather_sunny_20_regular.svg")))
+        self._moon_icon = QSvgRenderer(str(asset_path("icons/weather_moon_20_regular.svg")))
+
+    @staticmethod
+    def _tinted_icon(icon: QSvgRenderer, color: QColor) -> QPixmap:
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        icon.render(painter, pixmap.rect())
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        painter.fillRect(pixmap.rect(), color)
+        painter.end()
+        return pixmap
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         is_light = self.isChecked()
         track = self.rect().adjusted(1, 1, -1, -1)
-        track_color = QColor("#c18a50" if is_light else "#29251f")
-        border_color = QColor("#b7834f" if is_light else "#554a3e")
-        knob_color = QColor("#fffaf3" if is_light else "#cfc6bb")
+        track_color = QColor("#f0f3f8" if is_light else "#242b3c")
+        border_color = QColor("#c6d0de" if is_light else "#3b4559")
         painter.setPen(QPen(border_color, 1))
         painter.setBrush(track_color)
-        painter.drawRoundedRect(track, 12, 12)
+        painter.drawRoundedRect(track, 13, 13)
+
+        sun_color = QColor("#d89a1d" if is_light else "#6f7b8e")
+        moon_color = QColor("#7c8799" if is_light else "#9db9ef")
+        painter.drawPixmap(7, 6, self._tinted_icon(self._sun_icon, sun_color))
+        painter.drawPixmap(63, 6, self._tinted_icon(self._moon_icon, moon_color))
+
+        switch_track = self.rect().adjusted(27, 5, -27, -5)
+        switch_color = QColor("#f2ba3f" if is_light else "#2b6bd8")
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(knob_color)
-        knob_size = 18
-        knob_x = self.width() - knob_size - 4 if is_light else 4
-        painter.drawEllipse(knob_x, (self.height() - knob_size) // 2, knob_size, knob_size)
+        painter.setBrush(switch_color)
+        painter.drawRoundedRect(switch_track, 9, 9)
+        painter.setBrush(QColor("#ffffff"))
+        knob_size = 14
+        knob_x = 29 if is_light else 43
+        painter.drawEllipse(knob_x, 7, knob_size, knob_size)
 
 
 class WatchlistDialog(QDialog):
@@ -272,36 +294,36 @@ class WatchlistDialog(QDialog):
         layout.addWidget(buttons)
 
         dialog_stylesheet = """
-            QDialog { background: #181613; color: #ded8cf; }
-            QLabel, QCheckBox { color: #ded8cf; font-family: "Noto Sans SC"; }
-            QLabel#dialogTitle { color: #f3ede4; font: 600 19px "Noto Serif SC"; }
-            QLabel#dialogHelp { color: #9d9489; font-size: 12px; }
-            QLabel#dialogError { color: #df5b55; font-size: 12px; }
+            QDialog { background: #0c1622; color: #c8d2df; }
+            QLabel, QCheckBox { color: #c8d2df; font-family: "Noto Sans SC"; }
+            QLabel#dialogTitle { color: #eef4fb; font: 600 19px "Noto Sans SC"; }
+            QLabel#dialogHelp { color: #8797aa; font-size: 12px; }
+            QLabel#dialogError { color: #f05a5f; font-size: 12px; }
             QPlainTextEdit, QDoubleSpinBox, QSpinBox {
-                color: #eee7de; background: #211e1a; border: 1px solid #443c33;
+                color: #e6edf6; background: #111e2c; border: 1px solid #324257;
                 border-radius: 8px; padding: 7px; font: 13px "Noto Sans SC";
             }
             QPushButton {
-                color: #d8d0c6; background: #24201b; border: 1px solid #443c33;
+                color: #b8c5d6; background: #111e2c; border: 1px solid #324257;
                 border-radius: 8px; padding: 7px 18px; font: 600 12px "Noto Sans SC";
             }
-            QPushButton:hover { color: #f0d3af; border-color: #a97745; }
-            QPushButton#saveButton { color: #fffaf3; background: #97683a; border-color: #ad7b49; }
-            QPushButton#saveButton:hover { background: #aa7844; }
+            QPushButton:hover { color: #eef5ff; border-color: #4b82de; background: #16263a; }
+            QPushButton#saveButton { color: white; background: #2467d8; border-color: #3b7ce8; }
+            QPushButton#saveButton:hover { background: #3278e8; }
             """
         if theme == "beige":
             dialog_stylesheet += """
-            QDialog { background: #fbf8f2; color: #342f2a; }
-            QLabel, QCheckBox { color: #34312d; }
-            QLabel#dialogTitle { color: #26231f; }
-            QLabel#dialogHelp { color: #81776d; }
+            QDialog { background: #f6f8fb; color: #243247; }
+            QLabel, QCheckBox { color: #243247; }
+            QLabel#dialogTitle { color: #17253a; }
+            QLabel#dialogHelp { color: #68778c; }
             QPlainTextEdit, QDoubleSpinBox, QSpinBox {
-                color: #2f2c28; background: #fffdfa; border-color: #d6c8b4;
+                color: #1f2d42; background: #ffffff; border-color: #c6d2e1;
             }
-            QPushButton { color: #62584e; background: #faf6ef; border-color: #d6c8b4; }
-            QPushButton:hover { color: #4b3420; background: #f2e6d6; border-color: #b7834f; }
-            QPushButton#saveButton { color: #fffaf4; background: #b57c42; border-color: #b57c42; }
-            QPushButton#saveButton:hover { background: #c18a50; }
+            QPushButton { color: #40516a; background: #f0f4f9; border-color: #c6d2e1; }
+            QPushButton:hover { color: #1e56af; background: #e7effb; border-color: #6b97dc; }
+            QPushButton#saveButton { color: white; background: #2d6ed8; border-color: #2d6ed8; }
+            QPushButton#saveButton:hover { background: #3b7de7; }
             """
         self.setStyleSheet(dialog_stylesheet)
 
@@ -373,7 +395,7 @@ class QuotePanel(QWidget):
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("股票桌宠 · 行情卡")
+        title = QLabel(f"股票桌宠 · v{__version__}")
         title.setObjectName("title")
         self.theme_switch = ThemeSwitch()
         self.theme_switch.setChecked(self.current_theme == "beige")
@@ -393,13 +415,10 @@ class QuotePanel(QWidget):
         layout.addLayout(header)
 
         search = QHBoxLayout()
-        self.symbol_input = ChevronComboBox()
-        self.symbol_input.setEditable(True)
-        self.symbol_input.addItems(self.watchlist)
-        self.symbol_input.setCurrentText(last_symbol)
-        self.symbol_input.lineEdit().setPlaceholderText("00700 / 600519 / HSI / GOLD")
-        self.symbol_input.lineEdit().returnPressed.connect(self.fetch_quote)
-        self.symbol_input.activated.connect(lambda index: self.fetch_quote())
+        self.symbol_input = QLineEdit()
+        self.symbol_input.setText(last_symbol)
+        self.symbol_input.setPlaceholderText("00700 / 600519 / HSI / GOLD")
+        self.symbol_input.returnPressed.connect(self.fetch_quote)
         self.fetch_button = QPushButton("拉取行情")
         self.fetch_button.setObjectName("fetchButton")
         self.fetch_button.clicked.connect(self.fetch_quote)
@@ -490,168 +509,151 @@ class QuotePanel(QWidget):
         self._dark_stylesheet = (
             """
             QFrame#card {
-                background: rgba(18, 17, 15, 250);
-                border: 1px solid #3b342c;
+                background: rgba(10, 18, 28, 252);
+                border: 1px solid #2f3e51;
                 border-radius: 18px;
             }
-            QLabel { color: #ded8cf; font-family: "Noto Sans SC"; }
+            QLabel { color: #c7d1de; font-family: "Noto Sans SC"; }
             QLabel#title {
-                color: #f3ede4; font: 600 18px "Noto Serif SC";
+                color: #edf3fa; font: 650 18px "Noto Sans SC";
             }
             QLabel#stockName {
-                color: #d6cec4; font: 600 14px "Noto Serif SC";
+                color: #c7d1de; font: 600 14px "Noto Sans SC";
             }
-            QLabel#price { color: #f6efe6; font: 700 32px "Noto Serif SC"; }
+            QLabel#price { color: #eef4fb; font: 700 32px "Noto Sans SC"; }
             QLabel#change { font-size: 17px; font-weight: 600; }
-            QLabel#details { color: #aaa298; font-size: 12px; line-height: 1.5; }
+            QLabel#details { color: #9aa9bd; font-size: 12px; line-height: 1.5; }
             QFrame#marketSummary {
-                background: #161411;
-                border-top: 1px solid #393128; border-bottom: 1px solid #393128;
+                background: #0e1926;
+                border-top: 1px solid #2f4055; border-bottom: 1px solid #2f4055;
             }
-            QLabel#marketSummaryCell { color: #c9c0b5; font-size: 10px; }
-            QFrame#summaryDivider { background: #393128; border: none; }
-            QLabel#status { color: #776f67; font-size: 10px; }
-            QLabel#monitor { color: #877f76; font-size: 10px; }
+            QLabel#marketSummaryCell { color: #b7c4d5; font-size: 10px; }
+            QFrame#summaryDivider { background: #2f4055; border: none; }
+            QLabel#status { color: #73849a; font-size: 10px; }
+            QLabel#monitor { color: #7f90a5; font-size: 10px; }
             QTabWidget#marketTabs::pane {
-                background: #191714; border: 1px solid #39332c;
+                background: #101b28; border: 1px solid #304158;
                 border-radius: 10px; top: -1px;
             }
             QTabBar::tab {
-                color: #9e968c; background: #1c1a17; border: 1px solid #39332c;
+                color: #9aaabd; background: #0e1824; border: 1px solid #304158;
                 padding: 7px 22px; min-width: 72px;
-                font: 500 12px "Noto Sans SC";
+                font: 600 12px "Noto Sans SC";
             }
             QTabBar::tab:first { border-top-left-radius: 8px; }
             QTabBar::tab:last { border-top-right-radius: 8px; }
             QTabBar::tab:selected {
-                color: #e7c79f; background: #2a251f; border-bottom: 2px solid #b7834f;
+                color: #ffffff; background: #2464d3; border-color: #3678e7;
             }
             QListWidget#stockList, QListWidget#indexList {
-                color: #d9d2c9; background: #1b1916; border: none;
+                color: #cbd5e1; background: #101b28; border: none;
                 outline: none; padding: 0; font: 12px "Noto Sans SC";
             }
             QListWidget#stockList::item {
-                border: none; border-bottom: 1px solid #39332c;
+                border: none; border-bottom: 1px solid #2f4055;
                 border-radius: 0; margin: 0; padding: 9px 12px;
             }
-            QListWidget#stockList::item:hover { background: #27231e; }
+            QListWidget#stockList::item:hover { background: #162538; }
             QListWidget#stockList::item:selected {
-                background: #2e2821;
+                background: #17283b;
             }
             QListWidget#indexList { font-size: 11px; }
             QListWidget#indexList::item {
-                border: none; border-bottom: 1px solid #39332c;
+                border: none; border-bottom: 1px solid #2f4055;
                 border-radius: 0; margin: 0; padding: 1px 10px;
             }
             QListWidget#indexList::item:disabled {
-                background: #151310; border: none;
+                background: #0c1621; border: none;
                 margin: 0; padding: 1px 10px;
             }
-            QListWidget#indexList::item:hover { background: #27231e; }
+            QListWidget#indexList::item:hover { background: #162538; }
             QListWidget#indexList::item:selected {
-                background: #2e2821;
+                background: #17283b;
             }
-            QComboBox, QLineEdit {
-                color: #eee7de; background: #201d19; border: 1px solid #443c33;
-                border-radius: 10px; padding: 8px 38px 8px 10px; font: 13px "Noto Sans SC";
+            QLineEdit {
+                color: #e7eef7; background: #101b28; border: 1px solid #32445b;
+                border-radius: 10px; padding: 8px 10px; font: 13px "Noto Sans SC";
             }
-            QComboBox:focus, QLineEdit:focus { border-color: #a97745; }
-            QComboBox::drop-down {
-                subcontrol-origin: border; subcontrol-position: top right;
-                width: 34px; background: #29241e; border: none;
-                border-top-right-radius: 9px; border-bottom-right-radius: 9px;
-            }
-            QComboBox::drop-down:hover { background: #332b23; }
-            QComboBox::down-arrow { image: none; width: 0; height: 0; }
-            QComboBox QAbstractItemView {
-                color: #eee7de; background: #201d19; border: 1px solid #443c33;
-                selection-background-color: #4b3928; padding: 5px;
-            }
+            QLineEdit:focus { border-color: #4b83e3; }
             QPushButton { font-family: "Noto Sans SC"; cursor: pointer; }
             QPushButton#fetchButton {
-                color: #fffaf3; background: #97683a; border: 1px solid #ad7b49; border-radius: 10px;
+                color: #ffffff; background: #2467d8; border: 1px solid #397bec; border-radius: 10px;
                 padding: 8px 13px; font-weight: 700;
             }
-            QPushButton#fetchButton:hover { background: #aa7844; }
-            QPushButton#fetchButton:disabled { background: #494139; color: #8f867c; }
+            QPushButton#fetchButton:hover { background: #3278e8; }
+            QPushButton#fetchButton:disabled { background: #26364a; color: #74859b; }
             QPushButton#secondaryButton, QPushButton#headerButton {
-                color: #aaa197; background: #201d19; border: 1px solid #443c33;
+                color: #a8b6c8; background: #101b28; border: 1px solid #32445b;
                 border-radius: 8px; padding: 5px 7px; font-size: 11px;
             }
             QPushButton#secondaryButton:hover, QPushButton#headerButton:hover {
-                color: #f0d3af; border-color: #a97745; background: #29231d;
+                color: #eef5ff; border-color: #4b83e3; background: #16263a;
             }
             QPushButton#closeButton {
-                color: #8e867d; background: transparent; border: none; font-size: 22px;
+                color: #7f91a8; background: transparent; border: none; font-size: 22px;
             }
             QPushButton#closeButton:hover {
-                color: #eee6dc; background: #29251f; border-radius: 8px;
+                color: #eef4fb; background: #16263a; border-radius: 8px;
             }
             """
         )
         self._beige_stylesheet = self._dark_stylesheet + """
             QFrame#card {
-                background: rgba(251, 248, 242, 252);
-                border-color: #b9aa92;
+                background: rgba(247, 249, 252, 252);
+                border-color: #b9c7d8;
             }
-            QLabel { color: #342f2a; }
-            QLabel#title { color: #28231f; }
-            QLabel#stockName { color: #4d453e; }
-            QLabel#price { color: #2a241f; }
-            QLabel#details { color: #665e56; }
+            QLabel { color: #243247; }
+            QLabel#title { color: #17253a; }
+            QLabel#stockName { color: #34455d; }
+            QLabel#price { color: #17253a; }
+            QLabel#details { color: #5f6f84; }
             QFrame#marketSummary {
-                background: #f8f3ea;
-                border-top-color: #dacdb9; border-bottom-color: #dacdb9;
+                background: #f1f5fa;
+                border-top-color: #cbd6e3; border-bottom-color: #cbd6e3;
             }
-            QLabel#marketSummaryCell { color: #4d453e; }
-            QFrame#summaryDivider { background: #dacdb9; }
-            QLabel#status, QLabel#monitor { color: #81776d; }
+            QLabel#marketSummaryCell { color: #40516a; }
+            QFrame#summaryDivider { background: #cbd6e3; }
+            QLabel#status, QLabel#monitor { color: #6d7d91; }
             QTabWidget#marketTabs::pane {
-                background: #f8f3eb; border-color: #d3c5b0;
+                background: #f8fafc; border-color: #c4d0df;
             }
             QTabBar::tab {
-                color: #6e655c; background: #f5efe6; border-color: #d3c5b0;
+                color: #56667c; background: #eef3f8; border-color: #c4d0df;
             }
             QTabBar::tab:selected {
-                color: #754619; background: #efdfca; border-bottom-color: #b7834f;
+                color: #ffffff; background: #2d6ed8; border-color: #2d6ed8;
             }
             QListWidget#stockList, QListWidget#indexList {
-                color: #39332d; background: #fbf8f2;
+                color: #26364b; background: #f8fafc;
             }
             QListWidget#stockList::item, QListWidget#indexList::item {
-                border-bottom-color: #e2d8ca;
+                border-bottom-color: #d5dee9;
             }
-            QListWidget#indexList::item:disabled { background: #f1e9dd; }
+            QListWidget#indexList::item:disabled { background: #eef3f8; }
             QListWidget#stockList::item:hover, QListWidget#indexList::item:hover {
-                background: #f6ecdf;
+                background: #edf3fb;
             }
             QListWidget#stockList::item:selected, QListWidget#indexList::item:selected {
-                background: #f1e2cf;
+                background: #e3edfc;
             }
-            QComboBox, QLineEdit {
-                color: #312b26; background: #fffdfa; border-color: #d6c8b4;
+            QLineEdit {
+                color: #1f2d42; background: #ffffff; border-color: #c4d0df;
             }
-            QComboBox:focus, QLineEdit:focus { border-color: #b98245; }
-            QComboBox::drop-down { background: #f2e6d6; }
-            QComboBox::drop-down:hover { background: #ead9c3; }
-            QComboBox QAbstractItemView {
-                color: #312b26; background: #fffdfa; border-color: #d6c8b4;
-                selection-background-color: #efdfca;
-            }
+            QLineEdit:focus { border-color: #5c8dde; }
             QPushButton#fetchButton {
-                color: #fffaf4; background: #b57c42; border-color: #b57c42;
+                color: #ffffff; background: #2d6ed8; border-color: #2d6ed8;
             }
-            QPushButton#fetchButton:hover { background: #c18a50; }
-            QPushButton#fetchButton:disabled { background: #d3c8b8; color: #81786e; }
+            QPushButton#fetchButton:hover { background: #3b7de7; }
+            QPushButton#fetchButton:disabled { background: #ccd6e3; color: #78879a; }
             QPushButton#secondaryButton, QPushButton#headerButton {
-                color: #62584e; background: #faf6ef; border-color: #d6c8b4;
+                color: #40516a; background: #f2f6fa; border-color: #c4d0df;
             }
             QPushButton#secondaryButton:hover, QPushButton#headerButton:hover {
-                color: #4b3420; border-color: #b7834f; background: #f2e6d6;
+                color: #1e56af; border-color: #6b97dc; background: #e7effb;
             }
-            QPushButton#closeButton { color: #776f65; }
+            QPushButton#closeButton { color: #6d7d91; }
             QPushButton#closeButton:hover {
-                color: #302a25; background: #eee4d7;
+                color: #1f2d42; background: #e7eef8;
             }
             """
         self._apply_theme()
@@ -662,13 +664,13 @@ class QuotePanel(QWidget):
         self._update_monitor_label()
 
     def _flat_color(self) -> str:
-        return "#4d463f" if self.current_theme == "beige" else "#c8c0b6"
+        return "#40516a" if self.current_theme == "beige" else "#c7d1de"
 
     def _up_color(self) -> str:
-        return "#c94039" if self.current_theme == "beige" else "#df5b55"
+        return "#d63f45" if self.current_theme == "beige" else "#f05a5f"
 
     def _down_color(self) -> str:
-        return "#2f8a5b" if self.current_theme == "beige" else "#3aa16d"
+        return "#248b57" if self.current_theme == "beige" else "#3dbc73"
 
     def _apply_theme(self) -> None:
         is_beige = self.current_theme == "beige"
@@ -702,7 +704,7 @@ class QuotePanel(QWidget):
         self.theme_switch.toggle()
 
     def fetch_symbol(self, symbol: str) -> None:
-        self.symbol_input.setCurrentText(symbol)
+        self.symbol_input.setText(symbol)
         self.fetch_quote()
 
     def _on_watchlist_item_clicked(self, item: QListWidgetItem) -> None:
@@ -746,10 +748,12 @@ class QuotePanel(QWidget):
         self.page_refresh_requested.emit(symbols)
 
     def _clear_quote_display(self) -> None:
-        self.symbol_input.setCurrentText("")
+        self.symbol_input.clear()
         self.name_label.setText("未选择行情")
         self.price_label.setText("--")
+        self.price_label.setStyleSheet("")
         self.change_label.setText("")
+        self.change_label.setStyleSheet("")
         self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
         self.status_label.setText("点击自选列表或输入代码拉取行情；行情可能延迟，仅供参考")
 
@@ -770,7 +774,7 @@ class QuotePanel(QWidget):
             if not symbol:
                 continue
             stock_list.setCurrentItem(item)
-            self.symbol_input.setCurrentText(str(symbol))
+            self.symbol_input.setText(str(symbol))
             normalized = normalize_symbol(str(symbol))
             quote = self._quote_cache.get(normalized.provider_symbol)
             if quote is not None:
@@ -778,7 +782,9 @@ class QuotePanel(QWidget):
             else:
                 self.name_label.setText(f"{normalized.display_code} · 等待刷新")
                 self.price_label.setText("--")
+                self.price_label.setStyleSheet("")
                 self.change_label.setText("")
+                self.change_label.setStyleSheet("")
                 self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
             return
         self._clear_quote_display()
@@ -803,8 +809,8 @@ class QuotePanel(QWidget):
     def _update_market_summary(self) -> None:
         summary_items = TAB_MARKET_SUMMARIES.get(self.market_tabs.currentIndex(), ())
         self.market_summary_frame.setVisible(bool(summary_items))
-        label_color = "#756b5d" if self.current_theme == "beige" else "#a99f93"
-        missing_color = "#81786d" if self.current_theme == "beige" else "#817970"
+        label_color = "#64758a" if self.current_theme == "beige" else "#8799af"
+        missing_color = "#7a899b" if self.current_theme == "beige" else "#74869d"
         for index, cell in enumerate(self.market_summary_cells):
             visible = index < len(summary_items)
             cell.setVisible(visible)
@@ -852,7 +858,7 @@ class QuotePanel(QWidget):
         self.index_list.clear()
         for group_name, symbols in INDEX_GROUPS:
             header = QListWidgetItem(group_name)
-            header.setForeground(QColor("#746b5e" if self.current_theme == "beige" else "#a99f93"))
+            header.setForeground(QColor("#64758a" if self.current_theme == "beige" else "#8799af"))
             header.setFlags(Qt.ItemFlag.NoItemFlags)
             header.setSizeHint(QSize(0, 18))
             self.index_list.addItem(header)
@@ -890,7 +896,7 @@ class QuotePanel(QWidget):
         stock_list.clear()
         if not symbols:
             empty_item = QListWidgetItem(empty_message)
-            empty_item.setForeground(QColor("#81786d" if self.current_theme == "beige" else "#817970"))
+            empty_item.setForeground(QColor("#7a899b" if self.current_theme == "beige" else "#74869d"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             stock_list.addItem(empty_item)
             return
@@ -916,7 +922,7 @@ class QuotePanel(QWidget):
             stock_list.addItem(item)
 
     def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
-        selected_symbol = self.symbol_input.currentText().strip()
+        selected_symbol = self.symbol_input.text().strip()
         for quote in quotes:
             self._quote_cache[quote.symbol.provider_symbol] = quote
         self._refresh_watchlist_lists()
@@ -933,7 +939,7 @@ class QuotePanel(QWidget):
 
     @Slot()
     def save_current_symbol(self) -> None:
-        raw_symbol = self.symbol_input.currentText().strip()
+        raw_symbol = self.symbol_input.text().strip()
         try:
             symbol = normalize_symbol(raw_symbol)
             watchlist = normalize_watchlist([*self.watchlist, symbol.code])
@@ -982,18 +988,9 @@ class QuotePanel(QWidget):
         self.settings.setValue("alert_interval_seconds", interval_seconds)
         self.settings.setValue("alerts_enabled", alerts_enabled)
         self.settings.sync()
-        self._refresh_watchlist_choices()
         self._refresh_watchlist_lists()
         self._update_monitor_label()
         self.watchlist_changed.emit(watchlist, threshold, interval_seconds, alerts_enabled)
-
-    def _refresh_watchlist_choices(self) -> None:
-        current = self.symbol_input.currentText().strip()
-        self.symbol_input.blockSignals(True)
-        self.symbol_input.clear()
-        self.symbol_input.addItems(self.watchlist)
-        self.symbol_input.setCurrentText(current)
-        self.symbol_input.blockSignals(False)
 
     def _update_monitor_label(self) -> None:
         state = "提醒开" if self.alerts_enabled else "提醒关"
@@ -1003,7 +1000,7 @@ class QuotePanel(QWidget):
     def fetch_quote(self) -> None:
         if self._active_task is not None:
             return
-        symbol = self.symbol_input.currentText().strip()
+        symbol = self.symbol_input.text().strip()
         if not symbol:
             self._show_error("请输入股票代码。")
             return
@@ -1032,6 +1029,7 @@ class QuotePanel(QWidget):
         self.name_label.setText(f"{quote.name}  ·  {quote.symbol.display_code}  ·  {quote.symbol.market_label}")
         self.price_label.setText(f"{currency}{_price(quote.price)}")
         self.change_label.setText(f"{arrow} {quote.change_percent:+.2f}%")
+        self.price_label.setStyleSheet(f"color: {color};")
         self.change_label.setStyleSheet(f"color: {color};")
         if quote.symbol.market in {"hk_index", "cn_index", "gold"}:
             unit = "美元/盎司" if quote.symbol.market == "gold" else "指数点"
@@ -1052,7 +1050,9 @@ class QuotePanel(QWidget):
         self._finish_loading()
         self.name_label.setText("行情拉取失败")
         self.price_label.setText("--")
+        self.price_label.setStyleSheet("")
         self.change_label.setText("")
+        self.change_label.setStyleSheet("")
         self.status_label.setText(message)
 
     def _finish_loading(self) -> None:
@@ -1077,9 +1077,9 @@ class StockPetWidget(QWidget):
     quit_requested = Signal()
     alert_requested = Signal(str, str)
 
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.settings = QSettings()
+        self.settings = settings if settings is not None else QSettings()
         self.provider = TencentQuoteProvider()
         self.panel = QuotePanel(self.provider, self.settings)
         self.panel.quote_loaded.connect(self._apply_quote)
@@ -1117,7 +1117,10 @@ class StockPetWidget(QWidget):
         self.pet_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.current_skin = "default"
         self._skin_sheet: QPixmap | None = None
+        self._skin_animation = "idle"
+        self._skin_animation_after_once: str | None = None
         self._skin_frame = 0
+        self._refresh_activity_sources: set[str] = set()
         self.set_skin(str(self.settings.value("skin", "default")), persist=False)
 
         self._press_global: QPoint | None = None
@@ -1148,6 +1151,8 @@ class StockPetWidget(QWidget):
             skin_key = "default"
         display_name, filename, animated = SKINS[skin_key]
         self.current_skin = skin_key
+        self._skin_animation = "refresh" if self._refresh_activity_sources else "idle"
+        self._skin_animation_after_once = None
         self._skin_frame = 0
         if animated:
             sheet = QPixmap(str(asset_path(filename)))
@@ -1174,15 +1179,64 @@ class StockPetWidget(QWidget):
     def _render_skin_frame(self) -> None:
         if self._skin_sheet is None:
             return
+        row, frame_count, _loops = SPRITE_ANIMATIONS[self._skin_animation]
+        frame_index = min(self._skin_frame, frame_count - 1)
         frame = self._skin_sheet.copy(
-            self._skin_frame * SPRITE_CELL_WIDTH,
-            0,
+            frame_index * SPRITE_CELL_WIDTH,
+            row * SPRITE_CELL_HEIGHT,
             SPRITE_CELL_WIDTH,
             SPRITE_CELL_HEIGHT,
         )
         self.pet_label.setPixmap(
             frame.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
+
+    def _play_skin_animation(
+        self,
+        animation: str,
+        *,
+        restart: bool = False,
+        after_once: str | None = None,
+    ) -> None:
+        if animation not in SPRITE_ANIMATIONS:
+            animation = "idle"
+        if animation == self._skin_animation and not restart:
+            if after_once is not None:
+                self._skin_animation_after_once = after_once
+            return
+        self._skin_animation = animation
+        self._skin_animation_after_once = after_once
+        self._skin_frame = 0
+        self._render_skin_frame()
+
+    def _advance_skin_frame(self) -> None:
+        if self._skin_sheet is None:
+            return
+        _row, frame_count, loops = SPRITE_ANIMATIONS[self._skin_animation]
+        next_frame = self._skin_frame + 1
+        if next_frame < frame_count:
+            self._skin_frame = next_frame
+            self._render_skin_frame()
+            return
+        if loops:
+            self._skin_frame = 0
+            self._render_skin_frame()
+            return
+        next_animation = self._skin_animation_after_once
+        if next_animation is None:
+            next_animation = "refresh" if self._refresh_activity_sources else "idle"
+        self._play_skin_animation(next_animation, restart=True)
+
+    def _set_refresh_activity(self, source: str, active: bool) -> None:
+        if active:
+            self._refresh_activity_sources.add(source)
+        else:
+            self._refresh_activity_sources.discard(source)
+        target = "refresh" if self._refresh_activity_sources else "idle"
+        if self._skin_animation == "click":
+            self._skin_animation_after_once = target
+        elif self._skin_animation not in {"drag_left", "drag_right"}:
+            self._play_skin_animation(target)
 
     @Slot(object)
     def _apply_quote(self, quote: Quote) -> None:
@@ -1200,13 +1254,13 @@ class StockPetWidget(QWidget):
     def _apply_bubble_theme(self, theme: str) -> None:
         is_light = theme == "beige"
         if self._bubble_direction > 0:
-            foreground = "#c94039" if is_light else "#df5b55"
+            foreground = "#d63f45" if is_light else "#f05a5f"
         elif self._bubble_direction < 0:
-            foreground = "#2f8a5b" if is_light else "#3aa16d"
+            foreground = "#248b57" if is_light else "#3dbc73"
         else:
-            foreground = "#4d463f" if is_light else "#ded8cf"
-        background = "rgba(251, 248, 242, 244)" if is_light else "rgba(18, 17, 15, 238)"
-        border = "rgba(183, 131, 79, 120)" if is_light else "rgba(183, 131, 79, 85)"
+            foreground = "#40516a" if is_light else "#c7d1de"
+        background = "rgba(247, 249, 252, 246)" if is_light else "rgba(10, 18, 28, 242)"
+        border = "rgba(98, 125, 160, 110)" if is_light else "rgba(67, 91, 122, 190)"
         self.bubble.setStyleSheet(
             f"color: {foreground}; background: {background}; border: 1px solid {border};"
             "border-radius: 13px; font: 700 11px 'Noto Sans SC'; padding: 2px;"
@@ -1214,6 +1268,7 @@ class StockPetWidget(QWidget):
 
     @Slot(bool)
     def _loading_changed(self, loading: bool) -> None:
+        self._set_refresh_activity("quote", loading)
         if loading:
             self._bubble_direction = 0
             self.bubble.setText("正在拉取行情…")
@@ -1263,6 +1318,8 @@ class StockPetWidget(QWidget):
         task.signals.finished.connect(self._on_watchlist_result)
         self._watch_task = task
         self._watch_manual = manual
+        refresh_source = "page" if manual else "watchlist"
+        self._set_refresh_activity(refresh_source, True)
         if manual:
             self.panel.status_label.setText(f"正在刷新当前页的 {len(symbols)} 项行情…")
         QThreadPool.globalInstance().start(task)
@@ -1273,6 +1330,8 @@ class StockPetWidget(QWidget):
         manual = self._watch_manual
         self._watch_task = None
         self._watch_manual = False
+        refresh_source = "page" if manual else "watchlist"
+        self._set_refresh_activity(refresh_source, False)
         self.panel.update_watchlist_quotes(quotes)
 
         if manual:
@@ -1334,6 +1393,8 @@ class StockPetWidget(QWidget):
         if delta.manhattanLength() >= QApplication.startDragDistance():
             self._dragging = True
         if self._dragging:
+            drag_animation = "drag_left" if delta.x() < 0 else "drag_right"
+            self._play_skin_animation(drag_animation)
             self.move(self._press_window + delta)
             if self.panel.isVisible():
                 self.panel.place_near(self)
@@ -1344,7 +1405,11 @@ class StockPetWidget(QWidget):
             if self._dragging:
                 self._clamp_to_screen()
                 self.settings.setValue("pet_position", self.pos())
+                next_animation = "refresh" if self._refresh_activity_sources else "idle"
+                self._play_skin_animation(next_animation, restart=True)
             else:
+                next_animation = "refresh" if self._refresh_activity_sources else "idle"
+                self._play_skin_animation("click", restart=True, after_once=next_animation)
                 self.show_and_refresh()
             self._press_global = None
             self._press_window = None
@@ -1411,10 +1476,9 @@ class StockPetWidget(QWidget):
 
     def _animate(self) -> None:
         self._animation_tick += 1
-        if self._skin_sheet is not None and self._animation_tick % 4 == 0:
-            self._skin_frame = (self._skin_frame + 1) % SPRITE_IDLE_FRAMES
-            self._render_skin_frame()
-        offset = round(math.sin(self._animation_tick / 8.0) * 3)
+        if self._skin_sheet is not None and self._animation_tick % SPRITE_FRAME_TICKS == 0:
+            self._advance_skin_frame()
+        offset = round(math.sin(self._animation_tick / 8.0) * 3) if self._skin_animation == "idle" else 0
         self.pet_label.move(17, 52 + offset)
 
 

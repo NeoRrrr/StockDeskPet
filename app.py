@@ -8,6 +8,7 @@ from PySide6.QtCore import QLockFile
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
+from stock_pet import __version__
 from stock_pet.resources import asset_path
 from stock_pet.ui import StockPetWidget
 
@@ -15,6 +16,7 @@ from stock_pet.ui import StockPetWidget
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("StockDeskPet")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("StockDeskPet")
     app.setQuitOnLastWindowClosed(False)
 
@@ -29,7 +31,7 @@ def main() -> int:
     pet.show()
 
     tray = QSystemTrayIcon(QIcon(str(asset_path("ox_3d.png"))), app)
-    tray.setToolTip("股票桌宠")
+    tray.setToolTip(f"股票桌宠 v{__version__}")
     tray_menu = QMenu()
     show_action = QAction("显示桌宠", tray_menu)
     refresh_action = QAction("刷新当前页", tray_menu)
