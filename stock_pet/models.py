@@ -45,3 +45,9 @@ class Quote:
         if self.change_percent < 0:
             return -1
         return 0
+
+
+@dataclass(frozen=True, slots=True)
+class StockSearchResult:
+    symbol: StockSymbol
+    name: str

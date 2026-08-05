@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import math
 import os
+from html import escape
 
-from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QThreadPool, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QPoint, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QFontDatabase, QMouseEvent, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
     QCheckBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
+    QSlider,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTabWidget,
@@ -32,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .models import Quote
+from .models import Quote, StockSearchResult
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
 from .symbols import SymbolError, normalize_symbol, normalize_watchlist, partition_watchlist
@@ -71,6 +72,10 @@ TAB_MARKET_SUMMARIES: dict[int, tuple[tuple[str, str], ...]] = {
     0: (("沪指", "SHCOMP"), ("深指", "SZCOMP"), ("创业板", "CHINEXT")),
     1: (("恒生", "HSI"), ("恒科", "HSTECH")),
 }
+FAVORITE_REFRESH_INTERVAL_MS = 5_000
+OPEN_TAB_REFRESH_INTERVAL_MS = 10_000
+FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
+FAVORITE_BUBBLE_PAGE_SIZE = 5
 
 _UI_FONTS_LOADED = False
 
@@ -103,6 +108,22 @@ def _settings_list(settings: QSettings, key: str) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [str(item) for item in value if str(item).strip()]
     return []
+
+
+def _normalize_favorites(values: list[str]) -> list[str]:
+    """Normalize and de-duplicate stocks, indices and gold saved for the bubble."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            symbol = normalize_symbol(value)
+        except SymbolError:
+            continue
+        if symbol.provider_symbol in seen:
+            continue
+        seen.add(symbol.provider_symbol)
+        normalized.append(symbol.code)
+    return normalized
 
 
 class FetchSignals(QObject):
@@ -146,6 +167,22 @@ class WatchlistTask(QRunnable):
         self.signals.finished.emit((quotes, errors))
 
 
+class SearchTask(QRunnable):
+    def __init__(self, provider: TencentQuoteProvider, query: str) -> None:
+        super().__init__()
+        self.provider = provider
+        self.query = query
+        self.signals = FetchSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            results = self.provider.search(self.query)
+            self.signals.finished.emit((self.query, results, ""))
+        except Exception as exc:
+            self.signals.finished.emit((self.query, [], str(exc)))
+
+
 class QuoteItemDelegate(QStyledItemDelegate):
     """Keep semantic up/down colors visible when a quote row is selected."""
 
@@ -157,6 +194,62 @@ class QuoteItemDelegate(QStyledItemDelegate):
         if isinstance(foreground, QColor):
             option.palette.setColor(QPalette.ColorRole.Text, foreground)
             option.palette.setColor(QPalette.ColorRole.HighlightedText, foreground)
+
+
+class QuoteRowWidget(QWidget):
+    """Quote text plus a compact favorite button for a single list item."""
+
+    quote_requested = Signal(str)
+    favorite_toggled = Signal(str)
+
+    def __init__(
+        self,
+        text: str,
+        symbol: str,
+        color: str,
+        favorite: bool,
+        *,
+        compact: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.symbol = symbol
+        self.setObjectName("quoteRow")
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 7, 0)
+        layout.setSpacing(4)
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("quoteRowText")
+        self.text_label.setStyleSheet(f"color: {color};")
+        self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self.text_label, 1)
+
+        self.favorite_button = QPushButton("★" if favorite else "☆")
+        self.favorite_button.setObjectName("favoriteButton")
+        self.favorite_button.setCheckable(True)
+        self.favorite_button.setChecked(favorite)
+        self.favorite_button.setFixedSize(20 if compact else 24, 18 if compact else 24)
+        self.favorite_button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.favorite_button.setToolTip("取消收藏" if favorite else "收藏到桌宠气泡")
+        self.favorite_button.setAccessibleName(self.favorite_button.toolTip())
+        self.favorite_button.clicked.connect(self._toggle_favorite)
+        layout.addWidget(self.favorite_button)
+
+    @Slot(bool)
+    def _toggle_favorite(self, favorite: bool) -> None:
+        self.favorite_button.setText("★" if favorite else "☆")
+        self.favorite_button.setToolTip("取消收藏" if favorite else "收藏到桌宠气泡")
+        self.favorite_button.setAccessibleName(self.favorite_button.toolTip())
+        self.favorite_toggled.emit(self.symbol)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.quote_requested.emit(self.symbol)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class EqualWidthTabWidget(QTabWidget):
@@ -224,6 +317,8 @@ class ThemeSwitch(QAbstractButton):
 
 
 class WatchlistDialog(QDialog):
+    INTERVAL_OPTIONS = (30, 60, 120, 180, 300)
+
     def __init__(
         self,
         watchlist: list[str],
@@ -236,7 +331,7 @@ class WatchlistDialog(QDialog):
         super().__init__(parent)
         _load_ui_fonts()
         self.saved_config: tuple[list[str], float, int, bool] | None = None
-        self.setWindowTitle("编辑自选股")
+        self.setWindowTitle("自选与提醒设置")
         self.setModal(True)
         self.setMinimumSize(430, 420)
 
@@ -244,10 +339,10 @@ class WatchlistDialog(QDialog):
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
 
-        title = QLabel("编辑并保存股票 ID")
+        title = QLabel("自选与提醒设置")
         title.setObjectName("dialogTitle")
         help_label = QLabel(
-            "每行一个，最多 20 只。支持 00700、HK00700、600519、SH600519、000001。"
+            "每行输入一个股票代码，最多 20 只。支持港股、沪市、深市和北交所。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("dialogHelp")
@@ -259,22 +354,65 @@ class WatchlistDialog(QDialog):
         layout.addWidget(self.stock_ids)
 
         form = QFormLayout()
+        form.setVerticalSpacing(14)
         self.alerts_enabled = QCheckBox("启用系统通知")
         self.alerts_enabled.setChecked(alerts_enabled)
-        self.threshold = QDoubleSpinBox()
-        self.threshold.setRange(0.5, 20.0)
-        self.threshold.setDecimals(1)
-        self.threshold.setSingleStep(0.5)
-        self.threshold.setSuffix(" %")
-        self.threshold.setValue(threshold)
-        self.interval = QSpinBox()
-        self.interval.setRange(30, 3600)
-        self.interval.setSingleStep(30)
-        self.interval.setSuffix(" 秒")
-        self.interval.setValue(interval_seconds)
+        self.threshold = QSlider(Qt.Orientation.Horizontal)
+        self.threshold.setObjectName("settingsSlider")
+        self.threshold.setRange(5, 200)
+        self.threshold.setSingleStep(5)
+        self.threshold.setPageStep(10)
+        self.threshold.setValue(round(threshold * 10))
+        self.threshold.setToolTip("涨跌幅提醒阈值：0.5%–20%")
+        self.threshold_value = QLabel("")
+        self.threshold_value.setObjectName("sliderValue")
+        self.threshold_value.setFixedWidth(58)
+        self.threshold_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.threshold.valueChanged.connect(
+            lambda value: self.threshold_value.setText(f"{value / 10:.1f}%")
+        )
+        self.threshold_value.setText(f"{self.threshold.value() / 10:.1f}%")
+
+        self.interval = QSlider(Qt.Orientation.Horizontal)
+        self.interval.setObjectName("settingsSlider")
+        self.interval.setRange(0, len(self.INTERVAL_OPTIONS) - 1)
+        interval_index = min(
+            range(len(self.INTERVAL_OPTIONS)),
+            key=lambda index: abs(self.INTERVAL_OPTIONS[index] - interval_seconds),
+        )
+        self.interval.setValue(interval_index)
+        self.interval.setToolTip("系统通知检查间隔：30 秒–5 分钟")
+        self.interval_value = QLabel("")
+        self.interval_value.setObjectName("sliderValue")
+        self.interval_value.setFixedWidth(58)
+        self.interval_value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.interval.valueChanged.connect(self._update_interval_value)
+        self._update_interval_value(self.interval.value())
+
+        threshold_control = QWidget()
+        threshold_layout = QHBoxLayout(threshold_control)
+        threshold_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_layout.setSpacing(10)
+        threshold_layout.addWidget(self.threshold, 1)
+        threshold_layout.addWidget(self.threshold_value)
+        interval_control = QWidget()
+        interval_layout = QHBoxLayout(interval_control)
+        interval_layout.setContentsMargins(0, 0, 0, 0)
+        interval_layout.setSpacing(10)
+        interval_layout.addWidget(self.interval, 1)
+        interval_layout.addWidget(self.interval_value)
+
+        self.alerts_enabled.toggled.connect(self.threshold.setEnabled)
+        self.alerts_enabled.toggled.connect(self.interval.setEnabled)
+        self.alerts_enabled.toggled.connect(self.threshold_value.setEnabled)
+        self.alerts_enabled.toggled.connect(self.interval_value.setEnabled)
+        self.threshold.setEnabled(alerts_enabled)
+        self.interval.setEnabled(alerts_enabled)
+        self.threshold_value.setEnabled(alerts_enabled)
+        self.interval_value.setEnabled(alerts_enabled)
         form.addRow("提醒", self.alerts_enabled)
-        form.addRow("涨跌幅达到", self.threshold)
-        form.addRow("检查间隔", self.interval)
+        form.addRow("涨跌幅阈值", threshold_control)
+        form.addRow("检查间隔", interval_control)
         layout.addLayout(form)
 
         self.error_label = QLabel("")
@@ -296,12 +434,23 @@ class WatchlistDialog(QDialog):
         dialog_stylesheet = """
             QDialog { background: #0c1622; color: #c8d2df; }
             QLabel, QCheckBox { color: #c8d2df; font-family: "Noto Sans SC"; }
-            QLabel#dialogTitle { color: #eef4fb; font: 600 19px "Noto Sans SC"; }
+            QLabel#dialogTitle { color: #eef4fb; font: 600 18px "Microsoft YaHei UI"; }
             QLabel#dialogHelp { color: #8797aa; font-size: 12px; }
             QLabel#dialogError { color: #f05a5f; font-size: 12px; }
-            QPlainTextEdit, QDoubleSpinBox, QSpinBox {
+            QLabel#sliderValue { color: #aebed1; font: 600 12px "Noto Sans SC"; }
+            QPlainTextEdit {
                 color: #e6edf6; background: #111e2c; border: 1px solid #324257;
                 border-radius: 8px; padding: 7px; font: 13px "Noto Sans SC";
+            }
+            QSlider#settingsSlider::groove:horizontal {
+                height: 5px; background: #29394c; border-radius: 2px;
+            }
+            QSlider#settingsSlider::sub-page:horizontal {
+                background: #3f7fe2; border-radius: 2px;
+            }
+            QSlider#settingsSlider::handle:horizontal {
+                width: 16px; margin: -6px 0; background: #eef5ff;
+                border: 1px solid #3f7fe2; border-radius: 8px;
             }
             QPushButton {
                 color: #b8c5d6; background: #111e2c; border: 1px solid #324257;
@@ -317,8 +466,14 @@ class WatchlistDialog(QDialog):
             QLabel, QCheckBox { color: #243247; }
             QLabel#dialogTitle { color: #17253a; }
             QLabel#dialogHelp { color: #68778c; }
-            QPlainTextEdit, QDoubleSpinBox, QSpinBox {
+            QLabel#sliderValue { color: #40516a; }
+            QPlainTextEdit {
                 color: #1f2d42; background: #ffffff; border-color: #c6d2e1;
+            }
+            QSlider#settingsSlider::groove:horizontal { background: #d3dde9; }
+            QSlider#settingsSlider::sub-page:horizontal { background: #2d6ed8; }
+            QSlider#settingsSlider::handle:horizontal {
+                background: #ffffff; border-color: #2d6ed8;
             }
             QPushButton { color: #40516a; background: #f0f4f9; border-color: #c6d2e1; }
             QPushButton:hover { color: #1e56af; background: #e7effb; border-color: #6b97dc; }
@@ -326,6 +481,15 @@ class WatchlistDialog(QDialog):
             QPushButton#saveButton:hover { background: #3b7de7; }
             """
         self.setStyleSheet(dialog_stylesheet)
+
+    @Slot(int)
+    def _update_interval_value(self, index: int) -> None:
+        seconds = self.INTERVAL_OPTIONS[index]
+        if seconds < 60:
+            text = f"{seconds} 秒"
+        else:
+            text = f"{seconds // 60} 分钟"
+        self.interval_value.setText(text)
 
     @Slot()
     def _validate_and_accept(self) -> None:
@@ -337,8 +501,8 @@ class WatchlistDialog(QDialog):
             return
         self.saved_config = (
             watchlist,
-            float(self.threshold.value()),
-            int(self.interval.value()),
+            self.threshold.value() / 10.0,
+            self.INTERVAL_OPTIONS[self.interval.value()],
             bool(self.alerts_enabled.isChecked()),
         )
         self.accept()
@@ -348,7 +512,9 @@ class QuotePanel(QWidget):
     quote_loaded = Signal(object)
     loading_changed = Signal(bool)
     watchlist_changed = Signal(object, float, int, bool)
+    favorites_changed = Signal(object)
     page_refresh_requested = Signal(object)
+    periodic_page_refresh_requested = Signal(object)
     theme_changed = Signal(str)
 
     def __init__(self, provider: TencentQuoteProvider, settings: QSettings) -> None:
@@ -358,6 +524,13 @@ class QuotePanel(QWidget):
         self.settings = settings
         self.thread_pool = QThreadPool.globalInstance()
         self._active_task: FetchTask | None = None
+        self._search_task: SearchTask | None = None
+        self._pending_search_text = ""
+        self._search_display_to_symbol: dict[str, str] = {}
+        self._resolved_input_symbol: str | None = None
+        self._open_tab_refresh_timer = QTimer(self)
+        self._open_tab_refresh_timer.setInterval(OPEN_TAB_REFRESH_INTERVAL_MS)
+        self._open_tab_refresh_timer.timeout.connect(self._refresh_open_tab)
         last_symbol = ""
         saved_watchlist = _settings_list(settings, "watchlist")
         if settings.value("market_defaults_v1_added") is None:
@@ -375,6 +548,11 @@ class QuotePanel(QWidget):
         self.alert_threshold = float(settings.value("alert_threshold", 3.0))
         self.interval_seconds = int(settings.value("alert_interval_seconds", 60))
         self.alerts_enabled = _setting_bool(settings.value("alerts_enabled", True))
+        self.favorite_symbols = _normalize_favorites(_settings_list(settings, "favorites"))
+        self.panel_opacity = max(90, min(100, int(settings.value("panel_opacity", 100))))
+        settings.setValue("favorites", self.favorite_symbols)
+        settings.setValue("panel_opacity", self.panel_opacity)
+        settings.sync()
         self.current_theme = str(settings.value("theme", "dark"))
         if self.current_theme not in {"dark", "beige"}:
             self.current_theme = "dark"
@@ -417,11 +595,23 @@ class QuotePanel(QWidget):
         search = QHBoxLayout()
         self.symbol_input = QLineEdit()
         self.symbol_input.setText(last_symbol)
-        self.symbol_input.setPlaceholderText("00700 / 600519 / HSI / GOLD")
-        self.symbol_input.returnPressed.connect(self.fetch_quote)
+        self.symbol_input.setPlaceholderText("代码或名称：01810 / 小米 / HSI")
+        self._search_model = QStringListModel(self)
+        self.search_completer = QCompleter(self._search_model, self)
+        self.search_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.search_completer.setCompletionMode(QCompleter.CompletionMode.UnfilteredPopupCompletion)
+        self.search_completer.setMaxVisibleItems(8)
+        self.search_completer.activated[str].connect(self._on_search_suggestion)
+        self.symbol_input.setCompleter(self.search_completer)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(350)
+        self._search_timer.timeout.connect(self._search_by_name)
+        self.symbol_input.textEdited.connect(self._schedule_name_search)
+        self.symbol_input.returnPressed.connect(self.search_or_fetch)
         self.fetch_button = QPushButton("拉取行情")
         self.fetch_button.setObjectName("fetchButton")
-        self.fetch_button.clicked.connect(self.fetch_quote)
+        self.fetch_button.clicked.connect(self.search_or_fetch)
         search.addWidget(self.symbol_input, 1)
         search.addWidget(self.fetch_button)
         layout.addLayout(search)
@@ -435,8 +625,23 @@ class QuotePanel(QWidget):
         refresh_page_button.clicked.connect(self.refresh_current_tab)
         self.monitor_label = QLabel("")
         self.monitor_label.setObjectName("monitor")
+        opacity_label = QLabel("透明度")
+        opacity_label.setObjectName("opacityLabel")
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setObjectName("opacitySlider")
+        self.opacity_slider.setRange(90, 100)
+        self.opacity_slider.setValue(self.panel_opacity)
+        self.opacity_slider.setFixedWidth(54)
+        self.opacity_slider.setToolTip("调整行情卡透明度（90%–100%）")
+        self.opacity_value_label = QLabel(f"{self.panel_opacity}%")
+        self.opacity_value_label.setObjectName("opacityValue")
+        self.opacity_value_label.setFixedWidth(30)
+        self.opacity_slider.valueChanged.connect(self.set_panel_opacity)
         watchlist_row.addWidget(save_button)
         watchlist_row.addWidget(refresh_page_button)
+        watchlist_row.addWidget(opacity_label)
+        watchlist_row.addWidget(self.opacity_slider)
+        watchlist_row.addWidget(self.opacity_value_label)
         watchlist_row.addStretch()
         watchlist_row.addWidget(self.monitor_label)
         layout.addLayout(watchlist_row)
@@ -446,8 +651,14 @@ class QuotePanel(QWidget):
         self.market_tabs.setFixedHeight(235)
         self.a_share_list = QListWidget()
         self.hk_share_list = QListWidget()
+        self.favorite_list = QListWidget()
         self.index_list = QListWidget()
-        for stock_list in (self.a_share_list, self.hk_share_list, self.index_list):
+        for stock_list in (
+            self.a_share_list,
+            self.hk_share_list,
+            self.favorite_list,
+            self.index_list,
+        ):
             stock_list.setObjectName("stockList")
             stock_list.setAlternatingRowColors(False)
             stock_list.setItemDelegate(QuoteItemDelegate(stock_list))
@@ -457,6 +668,7 @@ class QuotePanel(QWidget):
         self.market_tabs.addTab(self.a_share_list, "大A")
         self.market_tabs.addTab(self.hk_share_list, "港股")
         self.market_tabs.addTab(self.index_list, "指数")
+        self.market_tabs.addTab(self.favorite_list, "收藏")
         layout.addWidget(self.market_tabs)
 
         self.name_label = QLabel("点击桌宠或输入代码拉取行情")
@@ -531,13 +743,14 @@ class QuotePanel(QWidget):
             QFrame#summaryDivider { background: #2f4055; border: none; }
             QLabel#status { color: #73849a; font-size: 10px; }
             QLabel#monitor { color: #7f90a5; font-size: 10px; }
+            QLabel#opacityLabel, QLabel#opacityValue { color: #7f90a5; font-size: 10px; }
             QTabWidget#marketTabs::pane {
                 background: #101b28; border: 1px solid #304158;
                 border-radius: 10px; top: -1px;
             }
             QTabBar::tab {
                 color: #9aaabd; background: #0e1824; border: 1px solid #304158;
-                padding: 7px 22px; min-width: 72px;
+                padding: 7px 12px; min-width: 60px;
                 font: 600 12px "Noto Sans SC";
             }
             QTabBar::tab:first { border-top-left-radius: 8px; }
@@ -557,6 +770,16 @@ class QuotePanel(QWidget):
             QListWidget#stockList::item:selected {
                 background: #17283b;
             }
+            QWidget#quoteRow { background: transparent; }
+            QLabel#quoteRowText {
+                background: transparent; border: none; font: 12px "Noto Sans SC";
+            }
+            QPushButton#favoriteButton {
+                color: #78899e; background: transparent; border: none;
+                border-radius: 6px; padding: 0; font-size: 17px;
+            }
+            QPushButton#favoriteButton:hover { color: #edf4ff; background: #21344a; }
+            QPushButton#favoriteButton:checked { color: #f2ba3f; }
             QListWidget#indexList { font-size: 11px; }
             QListWidget#indexList::item {
                 border: none; border-bottom: 1px solid #2f4055;
@@ -595,6 +818,16 @@ class QuotePanel(QWidget):
             QPushButton#closeButton:hover {
                 color: #eef4fb; background: #16263a; border-radius: 8px;
             }
+            QSlider#opacitySlider::groove:horizontal {
+                height: 4px; background: #29394c; border-radius: 2px;
+            }
+            QSlider#opacitySlider::sub-page:horizontal {
+                background: #3f7fe2; border-radius: 2px;
+            }
+            QSlider#opacitySlider::handle:horizontal {
+                width: 12px; margin: -4px 0; background: #eef5ff;
+                border: 1px solid #3f7fe2; border-radius: 6px;
+            }
             """
         )
         self._beige_stylesheet = self._dark_stylesheet + """
@@ -613,7 +846,7 @@ class QuotePanel(QWidget):
             }
             QLabel#marketSummaryCell { color: #40516a; }
             QFrame#summaryDivider { background: #cbd6e3; }
-            QLabel#status, QLabel#monitor { color: #6d7d91; }
+            QLabel#status, QLabel#monitor, QLabel#opacityLabel, QLabel#opacityValue { color: #6d7d91; }
             QTabWidget#marketTabs::pane {
                 background: #f8fafc; border-color: #c4d0df;
             }
@@ -636,6 +869,9 @@ class QuotePanel(QWidget):
             QListWidget#stockList::item:selected, QListWidget#indexList::item:selected {
                 background: #e3edfc;
             }
+            QPushButton#favoriteButton { color: #718096; }
+            QPushButton#favoriteButton:hover { color: #1e56af; background: #dce8f8; }
+            QPushButton#favoriteButton:checked { color: #d89516; }
             QLineEdit {
                 color: #1f2d42; background: #ffffff; border-color: #c4d0df;
             }
@@ -655,6 +891,11 @@ class QuotePanel(QWidget):
             QPushButton#closeButton:hover {
                 color: #1f2d42; background: #e7eef8;
             }
+            QSlider#opacitySlider::groove:horizontal { background: #d3dde9; }
+            QSlider#opacitySlider::sub-page:horizontal { background: #2d6ed8; }
+            QSlider#opacitySlider::handle:horizontal {
+                background: #ffffff; border-color: #2d6ed8;
+            }
             """
         self._apply_theme()
         self.market_tabs.currentChanged.connect(self._on_market_tab_changed)
@@ -662,6 +903,7 @@ class QuotePanel(QWidget):
         self._update_market_summary()
         self._select_first_current_tab_item()
         self._update_monitor_label()
+        self.setWindowOpacity(self.panel_opacity / 100.0)
 
     def _flat_color(self) -> str:
         return "#40516a" if self.current_theme == "beige" else "#c7d1de"
@@ -675,6 +917,20 @@ class QuotePanel(QWidget):
     def _apply_theme(self) -> None:
         is_beige = self.current_theme == "beige"
         self.setStyleSheet(self._beige_stylesheet if is_beige else self._dark_stylesheet)
+        if is_beige:
+            self.search_completer.popup().setStyleSheet(
+                "QListView { color:#243247; background:#ffffff; border:1px solid #b9c7d8; "
+                "padding:4px; font:12px 'Noto Sans SC'; } "
+                "QListView::item { padding:7px 8px; border-radius:5px; } "
+                "QListView::item:selected { color:#ffffff; background:#2d6ed8; }"
+            )
+        else:
+            self.search_completer.popup().setStyleSheet(
+                "QListView { color:#c7d1de; background:#101b28; border:1px solid #32445b; "
+                "padding:4px; font:12px 'Noto Sans SC'; } "
+                "QListView::item { padding:7px 8px; border-radius:5px; } "
+                "QListView::item:selected { color:#ffffff; background:#2464d3; }"
+            )
         self.symbol_input.setProperty("lightTheme", is_beige)
         self.symbol_input.update()
         was_blocked = self.theme_switch.blockSignals(True)
@@ -703,8 +959,115 @@ class QuotePanel(QWidget):
     def toggle_theme(self) -> None:
         self.theme_switch.toggle()
 
+    @staticmethod
+    def _extract_symbol_from_text(text: str) -> str | None:
+        candidates = [text, *(part.strip() for part in text.split("·"))]
+        for candidate in candidates:
+            try:
+                return normalize_symbol(candidate).code
+            except SymbolError:
+                continue
+        return None
+
+    def _current_input_symbol(self) -> str:
+        if self._resolved_input_symbol:
+            return self._resolved_input_symbol
+        text = self.symbol_input.text().strip()
+        return self._extract_symbol_from_text(text) or text
+
+    def _set_symbol_input_display(self, raw_symbol: str, name: str = "") -> None:
+        symbol = normalize_symbol(raw_symbol)
+        self._resolved_input_symbol = symbol.code
+        parts = [name.strip(), symbol.display_code, symbol.market_label]
+        self.symbol_input.setText(" · ".join(part for part in parts if part))
+
+    @Slot(str)
+    def _schedule_name_search(self, text: str) -> None:
+        self._resolved_input_symbol = None
+        keyword = text.strip()
+        if not keyword:
+            self._search_timer.stop()
+            self.search_completer.popup().hide()
+            return
+        try:
+            normalize_symbol(keyword)
+        except SymbolError:
+            self._search_timer.start()
+        else:
+            self._search_timer.stop()
+            self.search_completer.popup().hide()
+
+    @Slot()
+    def _search_by_name(self) -> None:
+        self._start_name_search(self.symbol_input.text().strip())
+
+    def _start_name_search(self, keyword: str) -> None:
+        if not keyword:
+            return
+        if self._search_task is not None:
+            self._pending_search_text = keyword
+            return
+        self.status_label.setText(f"正在搜索“{keyword}”…")
+        task = SearchTask(self.provider, keyword)
+        task.signals.finished.connect(self._on_search_results)
+        self._search_task = task
+        self.thread_pool.start(task)
+
+    @Slot(object)
+    def _on_search_results(
+        self,
+        payload: tuple[str, list[StockSearchResult], str],
+    ) -> None:
+        keyword, results, error = payload
+        self._search_task = None
+        current_text = self.symbol_input.text().strip()
+        if current_text == keyword:
+            self._search_display_to_symbol = {
+                f"{result.name} · {result.symbol.display_code} · {result.symbol.market_label}": result.symbol.code
+                for result in results
+            }
+            self._search_model.setStringList(list(self._search_display_to_symbol))
+            if results:
+                self.status_label.setText(f"找到 {len(results)} 个结果，请选择一项")
+                self.search_completer.setCompletionPrefix("")
+                self.search_completer.complete()
+            else:
+                self.search_completer.popup().hide()
+                self.status_label.setText(error or f"没有找到“{keyword}”对应的大A或港股")
+
+        pending = self._pending_search_text
+        self._pending_search_text = ""
+        if pending and pending != keyword:
+            self._start_name_search(pending)
+
+    @Slot(str)
+    def _on_search_suggestion(self, display_text: str) -> None:
+        symbol = self._search_display_to_symbol.get(display_text)
+        if not symbol:
+            return
+        self._search_timer.stop()
+        self._resolved_input_symbol = symbol
+        self.symbol_input.setText(display_text)
+        self.fetch_quote()
+
+    @Slot()
+    def search_or_fetch(self) -> None:
+        keyword = self._current_input_symbol()
+        if not keyword:
+            self._show_error("请输入股票代码或名称。")
+            return
+        try:
+            normalize_symbol(keyword)
+        except SymbolError:
+            self._search_timer.stop()
+            self._start_name_search(keyword)
+            return
+        self.fetch_quote()
+
     def fetch_symbol(self, symbol: str) -> None:
-        self.symbol_input.setText(symbol)
+        normalized = normalize_symbol(symbol)
+        quote = self._quote_cache.get(normalized.provider_symbol)
+        self._set_symbol_input_display(symbol, quote.name if quote else "")
         self.fetch_quote()
 
     def _on_watchlist_item_clicked(self, item: QListWidgetItem) -> None:
@@ -723,6 +1086,7 @@ class QuotePanel(QWidget):
             0: a_shares,
             1: hk_shares,
             2: list(INDEX_SYMBOLS),
+            3: list(self.favorite_symbols),
         }.get(self.market_tabs.currentIndex(), [])
 
     def _current_tab_refresh_symbols(self) -> list[str]:
@@ -747,7 +1111,16 @@ class QuotePanel(QWidget):
         self.status_label.setText(f"正在刷新{tab_name}的 {len(symbols)} 项行情…")
         self.page_refresh_requested.emit(symbols)
 
+    @Slot()
+    def _refresh_open_tab(self) -> None:
+        if not self.isVisible():
+            return
+        symbols = self._current_tab_refresh_symbols()
+        if symbols:
+            self.periodic_page_refresh_requested.emit(symbols)
+
     def _clear_quote_display(self) -> None:
+        self._resolved_input_symbol = None
         self.symbol_input.clear()
         self.name_label.setText("未选择行情")
         self.price_label.setText("--")
@@ -755,13 +1128,14 @@ class QuotePanel(QWidget):
         self.change_label.setText("")
         self.change_label.setStyleSheet("")
         self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    成交额 --")
-        self.status_label.setText("点击自选列表或输入代码拉取行情；行情可能延迟，仅供参考")
+        self.status_label.setText("点击自选列表或输入代码/名称拉取行情；行情可能延迟，仅供参考")
 
     def _current_stock_list(self) -> QListWidget | None:
         return {
             0: self.a_share_list,
             1: self.hk_share_list,
             2: self.index_list,
+            3: self.favorite_list,
         }.get(self.market_tabs.currentIndex())
 
     def _select_first_current_tab_item(self) -> None:
@@ -774,9 +1148,9 @@ class QuotePanel(QWidget):
             if not symbol:
                 continue
             stock_list.setCurrentItem(item)
-            self.symbol_input.setText(str(symbol))
             normalized = normalize_symbol(str(symbol))
             quote = self._quote_cache.get(normalized.provider_symbol)
+            self._set_symbol_input_display(str(symbol), quote.name if quote else "")
             if quote is not None:
                 self._display_quote(quote)
             else:
@@ -841,14 +1215,20 @@ class QuotePanel(QWidget):
         a_shares, hk_shares = partition_watchlist(self.watchlist)
         self._populate_market_list(self.a_share_list, a_shares, "暂无大A自选，点击“编辑自选”添加")
         self._populate_market_list(self.hk_share_list, hk_shares, "暂无港股自选，点击“编辑自选”添加")
+        self._populate_market_list(
+            self.favorite_list,
+            self.favorite_symbols,
+            "暂无收藏，点击行情右侧 ☆ 添加",
+        )
         self._populate_index_list()
         self.market_tabs.setTabText(0, f"大A ({len(a_shares)})")
         self.market_tabs.setTabText(1, f"港股 ({len(hk_shares)})")
         self.market_tabs.setTabText(2, f"指数 ({len(INDEX_SYMBOLS)})")
+        self.market_tabs.setTabText(3, f"收藏 ({len(self.favorite_symbols)})")
 
         active_keys = {
             normalize_symbol(code).provider_symbol
-            for code in [*self.watchlist, *INDEX_SYMBOLS]
+            for code in [*self.watchlist, *self.favorite_symbols, *INDEX_SYMBOLS]
         }
         for symbol_key in list(self._quote_cache):
             if symbol_key not in active_keys:
@@ -856,6 +1236,7 @@ class QuotePanel(QWidget):
 
     def _populate_index_list(self) -> None:
         self.index_list.clear()
+        favorite_keys = self._favorite_keys()
         for group_name, symbols in INDEX_GROUPS:
             header = QListWidgetItem(group_name)
             header.setForeground(QColor("#64758a" if self.current_theme == "beige" else "#8799af"))
@@ -880,12 +1261,22 @@ class QuotePanel(QWidget):
                         if quote.direction > 0
                         else self._down_color() if quote.direction < 0 else self._flat_color()
                     )
-                item = QListWidgetItem(text)
+                item = QListWidgetItem("")
                 item.setData(Qt.ItemDataRole.UserRole, code)
+                item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
                 item.setForeground(QColor(color))
                 item.setSizeHint(QSize(0, 18))
                 item.setToolTip("点击拉取该指数的详细行情")
                 self.index_list.addItem(item)
+                self._attach_quote_row(
+                    self.index_list,
+                    item,
+                    text,
+                    code,
+                    color,
+                    symbol.provider_symbol in favorite_keys,
+                    compact=True,
+                )
 
     def _populate_market_list(
         self,
@@ -901,6 +1292,7 @@ class QuotePanel(QWidget):
             stock_list.addItem(empty_item)
             return
 
+        favorite_keys = self._favorite_keys()
         for code in symbols:
             symbol = normalize_symbol(code)
             quote = self._quote_cache.get(symbol.provider_symbol)
@@ -915,14 +1307,90 @@ class QuotePanel(QWidget):
                     f"{arrow} {quote.change_percent:+.2f}%    {currency}{_price(quote.price)}"
                 )
                 color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
-            item = QListWidgetItem(text)
+            item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, code)
+            item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
             item.setForeground(QColor(color))
+            item.setSizeHint(QSize(0, 36))
             item.setToolTip("点击拉取这只股票的详细行情")
             stock_list.addItem(item)
+            self._attach_quote_row(
+                stock_list,
+                item,
+                text,
+                code,
+                color,
+                symbol.provider_symbol in favorite_keys,
+            )
+
+    def _favorite_keys(self) -> set[str]:
+        return {
+            normalize_symbol(code).provider_symbol for code in self.favorite_symbols
+        }
+
+    def _attach_quote_row(
+        self,
+        stock_list: QListWidget,
+        item: QListWidgetItem,
+        text: str,
+        symbol: str,
+        color: str,
+        favorite: bool,
+        *,
+        compact: bool = False,
+    ) -> None:
+        row = QuoteRowWidget(text, symbol, color, favorite, compact=compact)
+        row.quote_requested.connect(
+            lambda raw_symbol, target_list=stock_list, target_item=item: self._open_quote_row(
+                target_list, target_item, raw_symbol
+            )
+        )
+        row.favorite_toggled.connect(self.toggle_favorite)
+        stock_list.setItemWidget(item, row)
+
+    def _open_quote_row(
+        self,
+        stock_list: QListWidget,
+        item: QListWidgetItem,
+        raw_symbol: str,
+    ) -> None:
+        stock_list.setCurrentItem(item)
+        self.fetch_symbol(raw_symbol)
+
+    @Slot(str)
+    def toggle_favorite(self, raw_symbol: str) -> None:
+        try:
+            symbol = normalize_symbol(raw_symbol)
+        except SymbolError as exc:
+            self.status_label.setText(str(exc))
+            return
+
+        favorite_keys = self._favorite_keys()
+        if symbol.provider_symbol in favorite_keys:
+            self.favorite_symbols = [
+                code
+                for code in self.favorite_symbols
+                if normalize_symbol(code).provider_symbol != symbol.provider_symbol
+            ]
+            message = f"已取消收藏：{symbol.display_code}"
+        else:
+            self.favorite_symbols.append(symbol.code)
+            message = f"已收藏：{symbol.display_code}，桌宠每 5 秒刷新"
+
+        self.settings.setValue("favorites", self.favorite_symbols)
+        self.settings.sync()
+        selected_symbol = self._current_input_symbol()
+        self._refresh_watchlist_lists()
+        if self.market_tabs.currentIndex() == 3:
+            self._select_first_current_tab_item()
+        else:
+            self._select_symbol_in_current_list(selected_symbol)
+        self._update_monitor_label()
+        self.status_label.setText(message)
+        self.favorites_changed.emit(list(self.favorite_symbols))
 
     def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
-        selected_symbol = self.symbol_input.text().strip()
+        selected_symbol = self._current_input_symbol()
         for quote in quotes:
             self._quote_cache[quote.symbol.provider_symbol] = quote
         self._refresh_watchlist_lists()
@@ -939,7 +1407,7 @@ class QuotePanel(QWidget):
 
     @Slot()
     def save_current_symbol(self) -> None:
-        raw_symbol = self.symbol_input.text().strip()
+        raw_symbol = self._current_input_symbol()
         try:
             symbol = normalize_symbol(raw_symbol)
             watchlist = normalize_watchlist([*self.watchlist, symbol.code])
@@ -994,13 +1462,28 @@ class QuotePanel(QWidget):
 
     def _update_monitor_label(self) -> None:
         state = "提醒开" if self.alerts_enabled else "提醒关"
-        self.monitor_label.setText(f"{len(self.watchlist)}只 · ±{self.alert_threshold:.1f}% · {state}")
+        self.monitor_label.setText(f"{len(self.watchlist)}只 · ★{len(self.favorite_symbols)}")
+        self.monitor_label.setToolTip(
+            f"自选 {len(self.watchlist)} 只 · 收藏 {len(self.favorite_symbols)} 只 · "
+            f"提醒阈值 ±{self.alert_threshold:.1f}% · {state} · 每 {self.interval_seconds} 秒检查 · "
+            "收藏每 5 秒刷新 · 行情卡打开时当前页每 10 秒刷新"
+        )
+
+    @Slot(int)
+    def set_panel_opacity(self, value: int) -> None:
+        self.panel_opacity = max(90, min(100, int(value)))
+        if self.opacity_slider.value() != self.panel_opacity:
+            self.opacity_slider.setValue(self.panel_opacity)
+        self.opacity_value_label.setText(f"{self.panel_opacity}%")
+        self.setWindowOpacity(self.panel_opacity / 100.0)
+        self.settings.setValue("panel_opacity", self.panel_opacity)
+        self.settings.sync()
 
     @Slot()
     def fetch_quote(self) -> None:
         if self._active_task is not None:
             return
-        symbol = self.symbol_input.text().strip()
+        symbol = self._current_input_symbol()
         if not symbol:
             self._show_error("请输入股票代码。")
             return
@@ -1022,6 +1505,7 @@ class QuotePanel(QWidget):
         self.update_watchlist_quotes([quote])
 
     def _display_quote(self, quote: Quote) -> None:
+        self._set_symbol_input_display(quote.symbol.code, quote.name)
         currency = _currency_prefix(quote.symbol.currency)
         color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
@@ -1072,6 +1556,14 @@ class QuotePanel(QWidget):
         y = max(available.top(), min(y, available.bottom() - self.height() + 1))
         self.move(x, y)
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._open_tab_refresh_timer.start()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._open_tab_refresh_timer.stop()
+        super().hideEvent(event)
+
 
 class StockPetWidget(QWidget):
     quit_requested = Signal()
@@ -1085,35 +1577,51 @@ class StockPetWidget(QWidget):
         self.panel.quote_loaded.connect(self._apply_quote)
         self.panel.loading_changed.connect(self._loading_changed)
         self.panel.watchlist_changed.connect(self._apply_watchlist_config)
+        self.panel.favorites_changed.connect(self._apply_favorites)
         self.panel.page_refresh_requested.connect(self.refresh_market_page)
-        self.panel.theme_changed.connect(self._apply_bubble_theme)
+        self.panel.periodic_page_refresh_requested.connect(self.refresh_market_page_silent)
+        self.panel.theme_changed.connect(self._on_bubble_theme_changed)
         self.watchlist = list(self.panel.watchlist)
+        self.favorite_symbols = list(self.panel.favorite_symbols)
         self.alert_threshold = self.panel.alert_threshold
         self.interval_seconds = self.panel.interval_seconds
         self.alerts_enabled = self.panel.alerts_enabled
         self._watch_task: WatchlistTask | None = None
         self._watch_manual = False
+        self._watch_animate = False
         self._pending_page_symbols: list[str] | None = None
         self._alert_states: dict[str, int] = {}
         self._watch_timer = QTimer(self)
         self._watch_timer.timeout.connect(self.scan_watchlist)
         self._configure_watch_timer()
+        self._favorite_task: WatchlistTask | None = None
+        self._favorite_refresh_pending = False
+        self._favorite_quotes: list[Quote] = []
+        self._favorite_index = 0
+        self._favorite_refresh_timer = QTimer(self)
+        self._favorite_refresh_timer.timeout.connect(self.refresh_favorites)
+        self._favorite_carousel_timer = QTimer(self)
+        self._favorite_carousel_timer.timeout.connect(self._show_next_favorite)
+        self._bubble_showing_favorites = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(190, 210)
+        self.setFixedSize(300, 234)
 
-        self.bubble = QLabel("点我刷新行情", self)
-        self.bubble.setAlignment(Qt.AlignCenter)
+        self.bubble = QLabel("", self)
+        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bubble.setWordWrap(True)
-        self.bubble.setGeometry(8, 4, 174, 48)
+        self.bubble.setTextFormat(Qt.TextFormat.RichText)
+        self.bubble.setGeometry(6, 4, 288, 64)
         self.bubble.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._bubble_direction = 0
         self._apply_bubble_theme(self.panel.current_theme)
 
         self.pet_label = QLabel(self)
         self.pet_label.setAlignment(Qt.AlignCenter)
-        self.pet_label.setGeometry(17, 52, 156, 150)
+        self._pet_image_x = 72
+        self._pet_image_y = 72
+        self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, 156, 150)
         self.pet_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.current_skin = "default"
         self._skin_sheet: QPixmap | None = None
@@ -1131,6 +1639,9 @@ class StockPetWidget(QWidget):
         self._animation.timeout.connect(self._animate)
         self._animation.start(50)
 
+        self._configure_favorite_timers()
+        self._show_favorite_prompt()
+
         saved_pos = self.settings.value("pet_position")
         if isinstance(saved_pos, QPoint):
             self.move(saved_pos)
@@ -1140,6 +1651,8 @@ class StockPetWidget(QWidget):
 
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setToolTip("单击刷新当前行情页；拖动可移动；右键切换皮肤")
+        if self.favorite_symbols:
+            QTimer.singleShot(1_000, self.refresh_favorites)
         QTimer.singleShot(5_000, self.scan_watchlist)
 
     def _set_pet_image(self, filename: str) -> None:
@@ -1172,9 +1685,11 @@ class StockPetWidget(QWidget):
         if persist:
             self.settings.setValue("skin", self.current_skin)
             self.settings.sync()
-            self._bubble_direction = 0
-            self.bubble.setText(f"已切换皮肤\n{display_name}")
-            self._apply_bubble_theme(self.panel.current_theme)
+            if self._favorite_quotes:
+                current_page = (self._favorite_index - 1) % self._favorite_page_count()
+                self._render_favorite_page(current_page)
+            else:
+                self._show_favorite_prompt()
 
     def _render_skin_frame(self) -> None:
         if self._skin_sheet is None:
@@ -1238,17 +1753,199 @@ class StockPetWidget(QWidget):
         elif self._skin_animation not in {"drag_left", "drag_right"}:
             self._play_skin_animation(target)
 
-    @Slot(object)
-    def _apply_quote(self, quote: Quote) -> None:
+    def _configure_favorite_timers(self) -> None:
+        self._favorite_refresh_timer.stop()
+        if self.favorite_symbols:
+            self._favorite_refresh_timer.start(FAVORITE_REFRESH_INTERVAL_MS)
+
+    def _resize_for_bubble(self, line_count: int) -> None:
+        pet_global = self.mapToGlobal(self.pet_label.pos())
+        if line_count <= 0:
+            self.bubble.hide()
+            self._pet_image_x = 8
+            self._pet_image_y = 4
+            self.setFixedSize(172, 158)
+            self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, 156, 150)
+            if self.isVisible():
+                self.move(
+                    pet_global.x() - self._pet_image_x,
+                    pet_global.y() - self._pet_image_y,
+                )
+                self._clamp_to_screen()
+            return
+
+        bubble_height = 64 if line_count <= 2 else 20 + line_count * 18
+        self.bubble.show()
+        self._pet_image_x = 72
+        self._pet_image_y = bubble_height + 8
+        self.setFixedSize(300, self._pet_image_y + 158)
+        self.bubble.setGeometry(6, 4, 288, bubble_height)
+        self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, 156, 150)
+        if self.isVisible():
+            self.move(
+                pet_global.x() - self._pet_image_x,
+                pet_global.y() - self._pet_image_y,
+            )
+            self._clamp_to_screen()
+
+    def _show_favorite_prompt(self) -> None:
+        self._bubble_showing_favorites = False
+        self._bubble_direction = 0
+        if not self.favorite_symbols:
+            self.bubble.clear()
+            self._resize_for_bubble(0)
+            return
+        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._resize_for_bubble(2)
+        self.bubble.setText("正在加载收藏行情…")
+        self._apply_bubble_theme(self.panel.current_theme)
+
+    def _set_bubble_quote(self, quote: Quote, *, favorite: bool = False) -> None:
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
         prefix = _currency_prefix(quote.symbol.currency)
         suffix = " 点" if quote.symbol.currency == "PTS" else ""
+        marker = "★ " if favorite else ""
+        self._bubble_showing_favorites = favorite
         self._bubble_direction = quote.direction
+        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._resize_for_bubble(2)
         self.bubble.setText(
-            f"{quote.name}  {arrow} {quote.change_percent:+.2f}%\n"
-            f"{prefix}{_price(quote.price)}{suffix}"
+            f"{escape(marker + quote.name)}&nbsp;&nbsp;{arrow} {quote.change_percent:+.2f}%<br>"
+            f"{escape(quote.symbol.display_code)}&nbsp;&nbsp;{escape(prefix + _price(quote.price) + suffix)}"
         )
         self._apply_bubble_theme(self.panel.current_theme)
+
+    def _favorite_page_count(self) -> int:
+        return max(
+            1,
+            math.ceil(len(self._favorite_quotes) / FAVORITE_BUBBLE_PAGE_SIZE),
+        )
+
+    def _render_favorite_page(self, page_index: int) -> None:
+        start = page_index * FAVORITE_BUBBLE_PAGE_SIZE
+        quotes = self._favorite_quotes[start : start + FAVORITE_BUBBLE_PAGE_SIZE]
+        if not quotes:
+            self._show_favorite_prompt()
+            return
+
+        is_light = self.panel.current_theme == "beige"
+        lines: list[str] = []
+        for quote in quotes:
+            arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
+            if quote.direction > 0:
+                color = "#d63f45" if is_light else "#f05a5f"
+            elif quote.direction < 0:
+                color = "#248b57" if is_light else "#3dbc73"
+            else:
+                color = "#40516a" if is_light else "#c7d1de"
+            name = quote.name if len(quote.name) <= 11 else f"{quote.name[:10]}…"
+            prefix = _currency_prefix(quote.symbol.currency)
+            suffix = "点" if quote.symbol.currency == "PTS" else ""
+            lines.append(
+                f'<div style="color:{color};white-space:nowrap">'
+                f"★ {escape(name)}&nbsp;&nbsp;{arrow} {quote.change_percent:+.2f}%&nbsp;&nbsp;"
+                f"{escape(prefix + _price(quote.price) + suffix)}</div>"
+            )
+
+        self._bubble_showing_favorites = True
+        self._bubble_direction = 0
+        self.bubble.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._resize_for_bubble(len(quotes))
+        self.bubble.setText("".join(lines))
+        self._apply_bubble_theme(self.panel.current_theme)
+
+    @Slot()
+    def _show_next_favorite(self) -> None:
+        if not self._favorite_quotes:
+            self._show_favorite_prompt()
+            return
+        page_count = self._favorite_page_count()
+        page_index = self._favorite_index % page_count
+        self._render_favorite_page(page_index)
+        self._favorite_index = (page_index + 1) % page_count
+
+    @Slot(object)
+    def _apply_favorites(self, favorites: list[str]) -> None:
+        self.favorite_symbols = _normalize_favorites([str(item) for item in favorites])
+        favorite_keys = {
+            normalize_symbol(code).provider_symbol for code in self.favorite_symbols
+        }
+        self._favorite_quotes = [
+            quote
+            for quote in self._favorite_quotes
+            if quote.symbol.provider_symbol in favorite_keys
+        ]
+        self._favorite_index = 0
+        self._favorite_carousel_timer.stop()
+        self._configure_favorite_timers()
+        if not self.favorite_symbols:
+            self._show_favorite_prompt()
+            return
+        if self._favorite_quotes:
+            self._show_next_favorite()
+        else:
+            self._show_favorite_prompt()
+        if self._favorite_task is not None:
+            self._favorite_refresh_pending = True
+        else:
+            self.refresh_favorites()
+
+    @Slot()
+    def refresh_favorites(self) -> None:
+        if not self.favorite_symbols:
+            return
+        if self._favorite_task is not None:
+            return
+        task = WatchlistTask(self.provider, list(self.favorite_symbols))
+        task.signals.finished.connect(self._on_favorite_result)
+        self._favorite_task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_favorite_result(self, result: tuple[list[Quote], list[str]]) -> None:
+        quotes, errors = result
+        self._favorite_task = None
+        favorite_keys = {
+            normalize_symbol(code).provider_symbol for code in self.favorite_symbols
+        }
+        refreshed_quotes = [
+            quote for quote in quotes if quote.symbol.provider_symbol in favorite_keys
+        ]
+        if refreshed_quotes:
+            self._favorite_quotes = refreshed_quotes
+            page_count = self._favorite_page_count()
+            self._favorite_index %= page_count
+            self.panel.update_watchlist_quotes(refreshed_quotes)
+            if self._bubble_showing_favorites:
+                current_page = (self._favorite_index - 1) % page_count
+                self._render_favorite_page(current_page)
+                self._favorite_index = (current_page + 1) % page_count
+            else:
+                self._show_next_favorite()
+            if page_count > 1:
+                if not self._favorite_carousel_timer.isActive():
+                    self._favorite_carousel_timer.start(FAVORITE_BUBBLE_PAGE_INTERVAL_MS)
+            else:
+                self._favorite_carousel_timer.stop()
+        elif not self._favorite_quotes:
+            self._bubble_showing_favorites = False
+            self._bubble_direction = 0
+            self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._resize_for_bubble(2)
+            self.bubble.setText("收藏行情刷新失败<br>稍后自动重试")
+            self._apply_bubble_theme(self.panel.current_theme)
+        elif errors:
+            self._show_next_favorite()
+
+        if self._favorite_refresh_pending:
+            self._favorite_refresh_pending = False
+            QTimer.singleShot(0, self.refresh_favorites)
+
+    @Slot(object)
+    def _apply_quote(self, quote: Quote) -> None:
+        return
 
     @Slot(str)
     def _apply_bubble_theme(self, theme: str) -> None:
@@ -1266,13 +1963,16 @@ class StockPetWidget(QWidget):
             "border-radius: 13px; font: 700 11px 'Noto Sans SC'; padding: 2px;"
         )
 
+    @Slot(str)
+    def _on_bubble_theme_changed(self, theme: str) -> None:
+        self._apply_bubble_theme(theme)
+        if self._bubble_showing_favorites and self._favorite_quotes:
+            current_page = (self._favorite_index - 1) % self._favorite_page_count()
+            self._render_favorite_page(current_page)
+
     @Slot(bool)
     def _loading_changed(self, loading: bool) -> None:
         self._set_refresh_activity("quote", loading)
-        if loading:
-            self._bubble_direction = 0
-            self.bubble.setText("正在拉取行情…")
-            self._apply_bubble_theme(self.panel.current_theme)
 
     @Slot(object, float, int, bool)
     def _apply_watchlist_config(
@@ -1305,21 +2005,29 @@ class StockPetWidget(QWidget):
             self._pending_page_symbols = page_symbols
             self.panel.status_label.setText("已有刷新任务进行中，稍后刷新当前页…")
             return
-        self._start_quote_batch(page_symbols, manual=True)
+        self._start_quote_batch(page_symbols, manual=True, animate=True)
+
+    @Slot(object)
+    def refresh_market_page_silent(self, symbols: list[str]) -> None:
+        page_symbols = [str(symbol) for symbol in symbols]
+        if not page_symbols or self._watch_task is not None:
+            return
+        self._start_quote_batch(page_symbols, manual=False, animate=False)
 
     def scan_watchlist(self) -> None:
         if self._watch_task is not None:
             return
         symbols = [*self.watchlist, *INDEX_SYMBOLS]
-        self._start_quote_batch(symbols, manual=False)
+        self._start_quote_batch(symbols, manual=False, animate=False)
 
-    def _start_quote_batch(self, symbols: list[str], manual: bool) -> None:
+    def _start_quote_batch(self, symbols: list[str], manual: bool, animate: bool) -> None:
         task = WatchlistTask(self.provider, symbols)
         task.signals.finished.connect(self._on_watchlist_result)
         self._watch_task = task
         self._watch_manual = manual
-        refresh_source = "page" if manual else "watchlist"
-        self._set_refresh_activity(refresh_source, True)
+        self._watch_animate = animate
+        if animate:
+            self._set_refresh_activity("page", True)
         if manual:
             self.panel.status_label.setText(f"正在刷新当前页的 {len(symbols)} 项行情…")
         QThreadPool.globalInstance().start(task)
@@ -1328,10 +2036,12 @@ class StockPetWidget(QWidget):
     def _on_watchlist_result(self, result: tuple[list[Quote], list[str]]) -> None:
         quotes, errors = result
         manual = self._watch_manual
+        animate = self._watch_animate
         self._watch_task = None
         self._watch_manual = False
-        refresh_source = "page" if manual else "watchlist"
-        self._set_refresh_activity(refresh_source, False)
+        self._watch_animate = False
+        if animate:
+            self._set_refresh_activity("page", False)
         self.panel.update_watchlist_quotes(quotes)
 
         if manual:
@@ -1418,16 +2128,13 @@ class StockPetWidget(QWidget):
 
     def _show_menu(self, global_pos: QPoint) -> None:
         menu = QMenu(self)
-        refresh = QAction("刷新当前页", menu)
         open_panel = QAction("打开行情卡", menu)
         skin_menu = QMenu("切换皮肤", menu)
         hide = QAction("隐藏桌宠", menu)
         quit_action = QAction("退出", menu)
-        refresh.triggered.connect(self.show_and_refresh)
         open_panel.triggered.connect(self.show_panel)
         hide.triggered.connect(self.hide_all)
         quit_action.triggered.connect(self.quit_requested)
-        menu.addAction(refresh)
         menu.addAction(open_panel)
         for skin_key, (display_name, _filename, _animated) in SKINS.items():
             skin_action = QAction(display_name, skin_menu)
@@ -1479,7 +2186,7 @@ class StockPetWidget(QWidget):
         if self._skin_sheet is not None and self._animation_tick % SPRITE_FRAME_TICKS == 0:
             self._advance_skin_frame()
         offset = round(math.sin(self._animation_tick / 8.0) * 3) if self._skin_animation == "idle" else 0
-        self.pet_label.move(17, 52 + offset)
+        self.pet_label.move(self._pet_image_x, self._pet_image_y + offset)
 
 
 def _price(value: float) -> str:
