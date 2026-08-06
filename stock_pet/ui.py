@@ -139,6 +139,35 @@ def _automatic_refresh_symbols(
     )
 
 
+def _is_visible_in_idle_bubble(
+    raw_symbol: str,
+    at: datetime | None = None,
+) -> bool:
+    """Show cached favorites only during their market's trading-day window."""
+    try:
+        market = normalize_symbol(raw_symbol).market
+    except SymbolError:
+        return False
+
+    current = at or datetime.now(MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(MARKET_TIMEZONE)
+
+    if current.weekday() >= 5:
+        return market not in A_SHARE_MARKETS | HK_MARKETS | {"gold"}
+    if market == "gold":
+        return True
+
+    minute = current.hour * 60 + current.minute
+    if market in A_SHARE_MARKETS:
+        return A_SHARE_SESSIONS[0][0] <= minute < A_SHARE_SESSIONS[-1][1]
+    if market in HK_MARKETS:
+        return HK_SESSIONS[0][0] <= minute < HK_SESSIONS[-1][1]
+    return True
+
+
 def _load_ui_fonts() -> None:
     """Load the two editorial UI families explicitly for Qt and frozen builds."""
     global _UI_FONTS_LOADED
@@ -2162,14 +2191,28 @@ class StockPetWidget(QWidget):
     def _show_favorite_prompt(self) -> None:
         self._bubble_showing_favorites = False
         self._bubble_direction = 0
-        if not self.favorite_symbols:
-            self.bubble.clear()
-            self._resize_for_bubble(0)
+        if not self.favorite_symbols or not any(
+            _is_visible_in_idle_bubble(symbol) for symbol in self.favorite_symbols
+        ):
+            self._hide_favorite_bubble()
             return
         self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._resize_for_bubble(2)
         self.bubble.setText("正在加载收藏行情…")
         self._apply_bubble_theme(self.panel.current_theme)
+
+    def _hide_favorite_bubble(self) -> None:
+        self._bubble_showing_favorites = False
+        self._bubble_direction = 0
+        self.bubble.clear()
+        self._resize_for_bubble(0)
+
+    def _visible_favorite_quotes(self) -> list[Quote]:
+        return [
+            quote
+            for quote in self._favorite_quotes
+            if _is_visible_in_idle_bubble(quote.symbol.provider_symbol)
+        ]
 
     def _set_bubble_quote(self, quote: Quote, *, favorite: bool = False) -> None:
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
@@ -2189,14 +2232,16 @@ class StockPetWidget(QWidget):
     def _favorite_page_count(self) -> int:
         return max(
             1,
-            math.ceil(len(self._favorite_quotes) / FAVORITE_BUBBLE_PAGE_SIZE),
+            math.ceil(len(self._visible_favorite_quotes()) / FAVORITE_BUBBLE_PAGE_SIZE),
         )
 
     def _render_favorite_page(self, page_index: int) -> None:
+        visible_quotes = self._visible_favorite_quotes()
         start = page_index * FAVORITE_BUBBLE_PAGE_SIZE
-        quotes = self._favorite_quotes[start : start + FAVORITE_BUBBLE_PAGE_SIZE]
+        quotes = visible_quotes[start : start + FAVORITE_BUBBLE_PAGE_SIZE]
         if not quotes:
-            self._show_favorite_prompt()
+            self._favorite_carousel_timer.stop()
+            self._hide_favorite_bubble()
             return
 
         is_light = self.panel.current_theme == "beige"
@@ -2231,6 +2276,11 @@ class StockPetWidget(QWidget):
     def _show_next_favorite(self) -> None:
         if not self._favorite_quotes:
             self._show_favorite_prompt()
+            return
+        if not self._visible_favorite_quotes():
+            self._favorite_carousel_timer.stop()
+            self._favorite_index = 0
+            self._hide_favorite_bubble()
             return
         page_count = self._favorite_page_count()
         page_index = self._favorite_index % page_count
@@ -2268,6 +2318,15 @@ class StockPetWidget(QWidget):
     def refresh_favorites(self) -> None:
         if not self.favorite_symbols:
             return
+        if self._favorite_quotes:
+            if self._visible_favorite_quotes():
+                current_page = (self._favorite_index - 1) % self._favorite_page_count()
+                self._render_favorite_page(current_page)
+                self._favorite_index = (current_page + 1) % self._favorite_page_count()
+            else:
+                self._favorite_carousel_timer.stop()
+                self._favorite_index = 0
+                self._hide_favorite_bubble()
         if self._favorite_task is not None:
             return
         symbols = self._automatic_symbols_with_initialization(

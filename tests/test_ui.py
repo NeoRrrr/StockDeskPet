@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -20,12 +21,14 @@ from stock_pet.ui import (
     FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
     FAVORITE_REFRESH_INTERVAL_MS,
     INDEX_SYMBOLS,
+    MARKET_TIMEZONE,
     OPEN_TAB_REFRESH_INTERVAL_MS,
     SPRITE_ANIMATIONS,
     TAB_MARKET_SUMMARIES,
     QuotePanel,
     StockPetWidget,
     ThemeSwitch,
+    _is_visible_in_idle_bubble,
 )
 
 
@@ -222,19 +225,80 @@ class QuotePanelTests(unittest.TestCase):
                 quote(raw_symbol, f"收藏行情{index}", 2.5 if index % 2 else -1.2)
                 for index, raw_symbol in enumerate(favorite_symbols, start=1)
             ]
-            pet._on_favorite_result((quotes, []))
-            self.assertGreaterEqual(pet.bubble.width(), 280)
-            for index in range(1, 6):
-                self.assertIn(f"收藏行情{index}", pet.bubble.text())
-            self.assertNotIn("收藏行情6", pet.bubble.text())
-            self.assertEqual(
-                pet._favorite_carousel_timer.interval(),
-                FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
-            )
-            self.assertTrue(pet._favorite_carousel_timer.isActive())
-            pet._show_next_favorite()
-            self.assertIn("收藏行情6", pet.bubble.text())
+            with patch("stock_pet.ui._is_visible_in_idle_bubble", return_value=True):
+                pet._on_favorite_result((quotes, []))
+                self.assertGreaterEqual(pet.bubble.width(), 280)
+                for index in range(1, 6):
+                    self.assertIn(f"收藏行情{index}", pet.bubble.text())
+                self.assertNotIn("收藏行情6", pet.bubble.text())
+                self.assertEqual(
+                    pet._favorite_carousel_timer.interval(),
+                    FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
+                )
+                self.assertTrue(pet._favorite_carousel_timer.isActive())
+                pet._show_next_favorite()
+                self.assertIn("收藏行情6", pet.bubble.text())
             pet._favorite_carousel_timer.stop()
+            pet.panel.close()
+            pet.close()
+
+    def test_idle_bubble_hides_markets_after_their_close(self) -> None:
+        thursday = (2026, 8, 6)
+        self.assertTrue(
+            _is_visible_in_idle_bubble(
+                "159516", datetime(*thursday, 14, 59, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertFalse(
+            _is_visible_in_idle_bubble(
+                "159516", datetime(*thursday, 15, 0, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertTrue(
+            _is_visible_in_idle_bubble(
+                "01810", datetime(*thursday, 15, 59, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertFalse(
+            _is_visible_in_idle_bubble(
+                "01810", datetime(*thursday, 16, 0, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+
+    def test_idle_bubble_waits_without_a_visible_market(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            settings.setValue("favorites", ["159516"])
+            pet = StockPetWidget(settings)
+            pet._animation.stop()
+            pet._watch_timer.stop()
+            pet._favorite_refresh_timer.stop()
+            pet._favorite_carousel_timer.stop()
+            quote = Quote(
+                symbol=normalize_symbol("159516"),
+                name="半导体设备ETF国泰",
+                price=0.7,
+                previous_close=0.64,
+                open_price=0.642,
+                high=0.704,
+                low=0.642,
+                change=0.06,
+                change_percent=9.38,
+                volume=1.0,
+                volume_unit="手",
+                amount=1.0,
+                quote_time="2026-08-06 15:00:00",
+                source="测试行情",
+            )
+
+            with patch("stock_pet.ui._is_visible_in_idle_bubble", return_value=False):
+                pet._on_favorite_result(([quote], []))
+                pet._show_next_favorite()
+
+            self.assertTrue(pet.bubble.isHidden())
+            self.assertEqual(pet._skin_animation, "idle")
             pet.panel.close()
             pet.close()
 
