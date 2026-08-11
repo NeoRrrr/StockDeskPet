@@ -32,6 +32,7 @@ def main() -> int:
         return 0
 
     pet = StockPetWidget()
+    app.aboutToQuit.connect(pet.close_provider)
     pet.show()
 
     tray = QSystemTrayIcon(QIcon(str(asset_path("ox_3d.png"))), app)

@@ -23,6 +23,7 @@ try {
         --windowed `
         --name StockDeskPet `
         --add-data 'assets;assets' `
+        --collect-data futu `
         app.py
 }
 finally {

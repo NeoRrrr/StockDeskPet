@@ -26,6 +26,19 @@ The upstream MIT license text is included as `assets/LICENSE-FluentUIEmoji.txt`.
 
 The upstream MIT license text is included as `assets/LICENSE-FluentUISystemIcons.txt`.
 
+## Futu OpenAPI Python SDK
+
+- Source: https://github.com/FutunnOpen/py-futu-api
+- Package: `futu-api==10.9.6908`
+- License: Apache License 2.0
+
+The SDK is bundled with the Windows application to connect to a separately installed
+Futu OpenD process on the user's own computer. Futu OpenD itself is not included in
+this repository or release package. Market-data availability remains subject to the
+user's Futu account permissions, subscription quota, and Futu terms.
+
+The upstream Apache 2.0 license text is included as `assets/LICENSE-FutuAPI.txt`.
+
 ## CodexPet.xyz community skins
 
 - Ella Wave by sehjk: https://codexpet.xyz/pets/community/ella-wave/

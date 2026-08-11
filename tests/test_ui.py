@@ -20,6 +20,7 @@ from stock_pet.ui import (
     DEFAULT_HK_WATCHLIST,
     FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
     FAVORITE_REFRESH_INTERVAL_MS,
+    FavoriteButton,
     INDEX_SYMBOLS,
     MARKET_TIMEZONE,
     OPEN_TAB_REFRESH_INTERVAL_MS,
@@ -77,8 +78,8 @@ class QuotePanelTests(unittest.TestCase):
             a_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[0]]
             hk_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[1]]
             self.assertEqual(captured[0], [*DEFAULT_A_SHARE_ETFS, *a_summary])
-            self.assertEqual(captured[1], [*DEFAULT_HK_WATCHLIST, *hk_summary])
-            self.assertEqual(captured[2], list(INDEX_SYMBOLS))
+            self.assertEqual(periodic[0], [*DEFAULT_HK_WATCHLIST, *hk_summary])
+            self.assertEqual(periodic[1], list(INDEX_SYMBOLS))
             self.assertEqual(
                 panel.index_list.currentItem().data(Qt.ItemDataRole.UserRole),
                 INDEX_SYMBOLS[0],
@@ -89,7 +90,10 @@ class QuotePanelTests(unittest.TestCase):
             button_texts = {button.text() for button in panel.findChildren(QPushButton)}
             self.assertIn("刷新当前页", button_texts)
             self.assertNotIn("检查自选", button_texts)
-            self.assertEqual(panel.findChild(QLabel, "title").text(), f"股票桌宠 · v{__version__}")
+            self.assertEqual(panel.findChild(QLabel, "title").text(), "股票桌宠")
+            self.assertEqual(
+                panel.findChild(QLabel, "footerVersion").text(), f"v{__version__}"
+            )
             self.assertIsInstance(panel.symbol_input, QLineEdit)
             self.assertEqual(panel.findChildren(QComboBox), [])
             self.assertIsInstance(panel.theme_switch, ThemeSwitch)
@@ -172,7 +176,7 @@ class QuotePanelTests(unittest.TestCase):
 
             first_item = panel.a_share_list.item(0)
             first_row = panel.a_share_list.itemWidget(first_item)
-            favorite_button = first_row.findChild(QPushButton, "favoriteButton")
+            favorite_button = first_row.findChild(FavoriteButton, "favoriteButton")
             self.assertIsNotNone(favorite_button)
             self.assertTrue(favorite_button.isChecked())
 
@@ -185,7 +189,7 @@ class QuotePanelTests(unittest.TestCase):
 
             index_item = panel.index_list.item(1)
             index_row = panel.index_list.itemWidget(index_item)
-            index_button = index_row.findChild(QPushButton, "favoriteButton")
+            index_button = index_row.findChild(FavoriteButton, "favoriteButton")
             self.assertTrue(index_button.isChecked())
             panel.close()
 

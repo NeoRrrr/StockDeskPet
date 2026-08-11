@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QCompleter,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .hybrid_quote_provider import HybridQuoteProvider
 from .models import Quote, StockSearchResult
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
@@ -269,6 +271,20 @@ class SearchTask(QRunnable):
             self.signals.finished.emit((self.query, results, ""))
         except Exception as exc:
             self.signals.finished.emit((self.query, [], str(exc)))
+
+
+class ProviderStatusTask(QRunnable):
+    def __init__(self, provider: HybridQuoteProvider) -> None:
+        super().__init__()
+        self.provider = provider
+        self.signals = FetchSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.signals.finished.emit(self.provider.check_futu_status())
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
 
 
 class UpdateTaskSignals(QObject):
@@ -689,14 +705,23 @@ class WatchlistDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, theme: str = "dark", parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: QSettings,
+        provider: HybridQuoteProvider,
+        theme: str = "dark",
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         _load_ui_fonts()
+        self.settings = settings
+        self.provider = provider
+        self._provider_status_task: ProviderStatusTask | None = None
         self._update_task: UpdateCheckTask | None = None
         self._release_url = f"{PROJECT_URL}/releases"
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setFixedSize(430, 338)
+        self.setFixedSize(430, 478)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -704,10 +729,41 @@ class SettingsDialog(QDialog):
 
         title = QLabel("设置")
         title.setObjectName("settingsTitle")
-        subtitle = QLabel("应用信息与版本更新")
+        subtitle = QLabel("行情源、应用信息与版本更新")
         subtitle.setObjectName("settingsSubtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        source_card = QFrame()
+        source_card.setObjectName("sourceCard")
+        source_layout = QVBoxLayout(source_card)
+        source_layout.setContentsMargins(16, 13, 16, 13)
+        source_layout.setSpacing(8)
+        source_title = QLabel("行情数据源")
+        source_title.setObjectName("cardTitle")
+        source_layout.addWidget(source_title)
+
+        source_row = QHBoxLayout()
+        self.quote_source_combo = QComboBox()
+        self.quote_source_combo.setObjectName("quoteSourceCombo")
+        self.quote_source_combo.addItem("富途实时优先（推荐）", "auto")
+        self.quote_source_combo.addItem("腾讯延迟行情", "tencent")
+        saved_mode = str(settings.value("quote_source", "auto"))
+        saved_index = self.quote_source_combo.findData(saved_mode)
+        self.quote_source_combo.setCurrentIndex(max(0, saved_index))
+        self.check_provider_button = QPushButton("检测 OpenD")
+        self.check_provider_button.setObjectName("secondaryButton")
+        self.check_provider_button.clicked.connect(self.check_provider_status)
+        source_row.addWidget(self.quote_source_combo, 1)
+        source_row.addWidget(self.check_provider_button)
+        source_layout.addLayout(source_row)
+
+        self.provider_status = QLabel(provider.status_text())
+        self.provider_status.setObjectName("providerStatus")
+        self.provider_status.setWordWrap(True)
+        source_layout.addWidget(self.provider_status)
+        self.quote_source_combo.currentIndexChanged.connect(self._on_quote_source_changed)
+        layout.addWidget(source_card)
 
         version_card = QFrame()
         version_card.setObjectName("versionCard")
@@ -769,12 +825,22 @@ class SettingsDialog(QDialog):
             QLabel { color: #c8d2df; font-family: "Noto Sans SC"; }
             QLabel#settingsTitle { color: #eef4fb; font: 600 20px "Microsoft YaHei UI"; }
             QLabel#settingsSubtitle { color: #7f90a5; font-size: 12px; }
-            QFrame#versionCard {
+            QFrame#sourceCard, QFrame#versionCard {
                 background: #101b28; border: 1px solid #32445b; border-radius: 10px;
             }
-            QLabel#appName { color: #e8eff8; font: 600 14px "Noto Sans SC"; }
+            QLabel#cardTitle, QLabel#appName { color: #e8eff8; font: 600 14px "Noto Sans SC"; }
             QLabel#versionValue { color: #91a5bd; font-size: 12px; }
-            QLabel#updateStatus { color: #91a5bd; font-size: 12px; }
+            QLabel#providerStatus, QLabel#updateStatus { color: #91a5bd; font-size: 12px; }
+            QComboBox#quoteSourceCombo {
+                color: #e4edf7; background: #0c1622; border: 1px solid #32445b;
+                border-radius: 8px; padding: 7px 10px; min-height: 18px;
+            }
+            QComboBox#quoteSourceCombo:hover, QComboBox#quoteSourceCombo:focus { border-color: #4b83e3; }
+            QComboBox#quoteSourceCombo::drop-down { border: 0; width: 24px; }
+            QComboBox#quoteSourceCombo QAbstractItemView {
+                color: #e4edf7; background: #101b28; border: 1px solid #32445b;
+                selection-background-color: #2467d8;
+            }
             QPushButton {
                 border-radius: 8px; padding: 7px 12px; font: 600 12px "Noto Sans SC";
             }
@@ -798,9 +864,17 @@ class SettingsDialog(QDialog):
                 QDialog { background: #f6f8fb; }
                 QLabel { color: #243247; }
                 QLabel#settingsTitle { color: #17253a; }
-                QLabel#settingsSubtitle, QLabel#versionValue, QLabel#updateStatus { color: #68778c; }
-                QFrame#versionCard { background: #ffffff; border-color: #c6d2e1; }
-                QLabel#appName { color: #1f2d42; }
+                QLabel#settingsSubtitle, QLabel#providerStatus, QLabel#versionValue, QLabel#updateStatus { color: #68778c; }
+                QFrame#sourceCard, QFrame#versionCard { background: #ffffff; border-color: #c6d2e1; }
+                QLabel#cardTitle, QLabel#appName { color: #1f2d42; }
+                QComboBox#quoteSourceCombo {
+                    color: #243247; background: #ffffff; border-color: #c6d2e1;
+                }
+                QComboBox#quoteSourceCombo:hover, QComboBox#quoteSourceCombo:focus { border-color: #6b97dc; }
+                QComboBox#quoteSourceCombo QAbstractItemView {
+                    color: #243247; background: #ffffff; border-color: #c6d2e1;
+                    selection-background-color: #2d6ed8;
+                }
                 QProgressBar#updateProgress { color: #40516a; background: #e8eef6; border-color: #c6d2e1; }
                 QProgressBar#updateProgress::chunk { background: #2d6ed8; }
                 QPushButton#primaryButton { background: #2d6ed8; border-color: #2d6ed8; }
@@ -813,6 +887,46 @@ class SettingsDialog(QDialog):
                 }
             """
         self.setStyleSheet(stylesheet)
+
+    @Slot(int)
+    def _on_quote_source_changed(self, _index: int) -> None:
+        mode = str(self.quote_source_combo.currentData())
+        self.settings.setValue("quote_source", mode)
+        self.settings.sync()
+        self.provider.set_mode(mode)
+        if mode == "tencent":
+            self.provider_status.setText("当前使用腾讯公共行情；港股可能延迟约 15 分钟")
+        else:
+            self.provider_status.setText("富途实时优先；OpenD 不可用时自动切换腾讯备用行情")
+
+    @Slot()
+    def check_provider_status(self) -> None:
+        if self._provider_status_task is not None:
+            return
+        self.check_provider_button.setDisabled(True)
+        self.check_provider_button.setText("检测中…")
+        self.provider_status.setText("正在连接本机 127.0.0.1:11111…")
+        task = ProviderStatusTask(self.provider)
+        task.signals.finished.connect(self._on_provider_status)
+        task.signals.failed.connect(self._on_provider_status_error)
+        self._provider_status_task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_provider_status(self, result: tuple[bool, str]) -> None:
+        ok, message = result
+        self._finish_provider_status_check()
+        self.provider_status.setText(("✓ " if ok else "! ") + message)
+
+    @Slot(str)
+    def _on_provider_status_error(self, message: str) -> None:
+        self._finish_provider_status_check()
+        self.provider_status.setText(f"! {message}")
+
+    def _finish_provider_status_check(self) -> None:
+        self._provider_status_task = None
+        self.check_provider_button.setDisabled(False)
+        self.check_provider_button.setText("检测 OpenD")
 
     @Slot()
     def check_for_updates(self) -> None:
@@ -1085,7 +1199,12 @@ class QuotePanel(QWidget):
                 summary_layout.addWidget(divider)
         layout.addWidget(self.market_summary_frame)
 
-        self.status_label = QLabel("数据源：腾讯行情公共网页接口；行情可能延迟，仅供参考")
+        provider_status = (
+            provider.status_text()
+            if hasattr(provider, "status_text")
+            else "腾讯行情公共网页接口"
+        )
+        self.status_label = QLabel(f"行情源：{provider_status}；仅供参考")
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
         self.footer_version_label = QLabel(f"v{__version__}")
@@ -1838,7 +1957,12 @@ class QuotePanel(QWidget):
 
     @Slot()
     def open_settings(self) -> None:
-        SettingsDialog(theme=self.current_theme, parent=self).exec()
+        SettingsDialog(
+            self.settings,
+            self.provider,
+            theme=self.current_theme,
+            parent=self,
+        ).exec()
 
     def _save_watchlist_config(
         self,
@@ -1970,7 +2094,11 @@ class StockPetWidget(QWidget):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.settings = settings if settings is not None else QSettings()
-        self.provider = TencentQuoteProvider()
+        quote_source = str(self.settings.value("quote_source", "auto"))
+        if quote_source not in HybridQuoteProvider.MODES:
+            quote_source = "auto"
+        self.settings.setValue("quote_source", quote_source)
+        self.provider = HybridQuoteProvider(mode=quote_source)
         self.panel = QuotePanel(self.provider, self.settings)
         self.panel.quote_loaded.connect(self._apply_quote)
         self.panel.loading_changed.connect(self._loading_changed)
@@ -2054,6 +2182,10 @@ class StockPetWidget(QWidget):
         if self.favorite_symbols:
             QTimer.singleShot(1_000, self.refresh_favorites)
         QTimer.singleShot(5_000, self.scan_watchlist)
+
+    @Slot()
+    def close_provider(self) -> None:
+        self.provider.close()
 
     def _set_pet_image(self, filename: str) -> None:
         pixmap = QPixmap(str(asset_path(filename)))
