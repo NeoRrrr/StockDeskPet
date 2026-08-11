@@ -22,6 +22,7 @@ try {
         --onedir `
         --windowed `
         --name StockDeskPet `
+        --icon 'assets\app_icon.ico' `
         --add-data 'assets;assets' `
         --collect-data futu `
         app.py

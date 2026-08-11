@@ -23,6 +23,8 @@ def main() -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationName("StockDeskPet")
     app.setQuitOnLastWindowClosed(False)
+    app_icon = QIcon(str(asset_path("app_icon.png")))
+    app.setWindowIcon(app_icon)
 
     lock_path = Path(tempfile.gettempdir()) / "stock-desk-pet.lock"
     lock = QLockFile(str(lock_path))
@@ -35,7 +37,7 @@ def main() -> int:
     app.aboutToQuit.connect(pet.close_provider)
     pet.show()
 
-    tray = QSystemTrayIcon(QIcon(str(asset_path("ox_3d.png"))), app)
+    tray = QSystemTrayIcon(app_icon, app)
     tray.setToolTip(f"股票桌宠 v{__version__}")
     tray_menu = QMenu()
     show_action = QAction("显示桌宠", tray_menu)

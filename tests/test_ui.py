@@ -9,11 +9,13 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton, QSlider
 
 from stock_pet import __version__
 from stock_pet.models import Quote
 from stock_pet.quote_provider import TencentQuoteProvider
+from stock_pet.resources import asset_path
 from stock_pet.symbols import normalize_symbol
 from stock_pet.ui import (
     DEFAULT_A_SHARE_ETFS,
@@ -37,6 +39,10 @@ class QuotePanelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_packaged_app_icon_assets_are_readable(self) -> None:
+        self.assertFalse(QIcon(str(asset_path("app_icon.png"))).isNull())
+        self.assertFalse(QIcon(str(asset_path("app_icon.ico"))).isNull())
 
     def test_current_tab_refresh_emits_only_visible_market(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
