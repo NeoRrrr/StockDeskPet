@@ -1,8 +1,18 @@
+<p align="center">
+  <img src="assets/app_icon.png" width="112" alt="StockDeskPet 股票桌宠图标">
+</p>
+
 # 股票桌宠 StockDeskPet
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Windows 股票桌宠 MVP：点击桌宠显示或隐藏行情卡。支持港股、沪市、深市，并预留北交所代码识别。
+
+<p align="center">
+  <img src="docs/images/quote-panel-dark.png" width="448" alt="股票桌宠深色行情卡">
+</p>
+
+<p align="center"><sub>富途 OpenD 实时行情优先 · 腾讯行情自动兜底 · 深浅双主题</sub></p>
 
 ## 当前功能
 
@@ -37,6 +47,26 @@ Windows 股票桌宠 MVP：点击桌宠显示或隐藏行情卡。支持港股�
 - CodexPet 图集皮肤支持状态动画：待机、手动刷新、左右拖拽和点击挥手
 - 收藏、自选检查和打开页定时刷新保持待机动画，仅手动拉取或刷新时播放刷新动画
 - 系统托盘支持显示、刷新、隐藏、退出
+
+## 界面预览
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/quote-panel-light.png" width="390" alt="浅色主题港股行情卡"><br>
+      <b>浅色主题与港股行情</b>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/settings-opend.png" width="390" alt="富途 OpenD 行情源设置"><br>
+      <b>行情源与 OpenD 检测</b>
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/pet-bubble.png" width="300" alt="桌宠收藏行情气泡"><br>
+  <b>桌宠收藏行情气泡</b>
+</p>
 
 ## 自选股与提醒
 
