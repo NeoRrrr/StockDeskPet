@@ -95,6 +95,8 @@ FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
 FAVORITE_BUBBLE_PAGE_SIZE = 5
 ALERT_REARM_MARGIN_PERCENT = 0.2
 ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
+STOCK_NAME_CACHE_SETTINGS_KEY = "stock_name_cache_v1"
+STOCK_NAME_ITEM_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 MARKET_CLOSE_REFRESH_GRACE_MINUTES = 10
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
@@ -216,6 +218,28 @@ def _settings_list(settings: QSettings, key: str) -> list[str]:
     return []
 
 
+def _normalize_stock_names(value: object) -> dict[str, str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    names: dict[str, str] = {}
+    for raw_symbol, raw_name in value.items():
+        name = " ".join(str(raw_name).split()).strip()
+        if not name:
+            continue
+        try:
+            symbol = normalize_symbol(str(raw_symbol))
+        except SymbolError:
+            continue
+        if symbol.market in {"hk", "sh", "sz", "bj"}:
+            names[symbol.provider_symbol] = name
+    return names
+
+
 def _normalize_favorites(values: list[str]) -> list[str]:
     """Normalize and de-duplicate stocks, indices and gold saved for the bubble."""
     normalized: list[str] = []
@@ -331,6 +355,27 @@ class FutuWatchlistTask(QRunnable):
             self.signals.finished.emit((self.action, self.group_name, data, ""))
         except Exception as exc:
             self.signals.finished.emit((self.action, self.group_name, [], str(exc)))
+
+
+class WatchlistNamesTask(QRunnable):
+    def __init__(self, provider: TencentQuoteProvider, symbols: list[str]) -> None:
+        super().__init__()
+        self.provider = provider
+        self.symbols = symbols
+        self.signals = FetchSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            quotes = self.provider.fetch_many(self.symbols)
+            names = {
+                quote.symbol.provider_symbol: quote.name
+                for quote in quotes
+                if quote.name
+            }
+            self.signals.finished.emit((names, ""))
+        except Exception as exc:
+            self.signals.finished.emit(({}, str(exc)))
 
 
 class UpdateTaskSignals(QObject):
@@ -577,6 +622,7 @@ class FutuWatchlistImportDialog(QDialog):
         }
         self.available_slots = max(0, self.MAX_WATCHLIST_ITEMS - len(self.existing_watchlist))
         self.selected_codes: list[str] = []
+        self.selected_names: dict[str, str] = {}
         self._task: FutuWatchlistTask | None = None
         self._updating_items = False
 
@@ -726,6 +772,7 @@ class FutuWatchlistImportDialog(QDialog):
             suffix = "  ·  已在桌宠自选" if existing else ""
             item = QListWidgetItem(f"{name}  ·  {symbol.display_code}{suffix}")
             item.setData(Qt.ItemDataRole.UserRole, symbol.code)
+            item.setData(STOCK_NAME_ITEM_ROLE, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             if existing:
@@ -765,6 +812,20 @@ class FutuWatchlistImportDialog(QDialog):
             if (item := self.stock_list.item(index)).checkState() == Qt.CheckState.Checked
         ]
 
+    def _names_for_codes(self, codes: list[str]) -> dict[str, str]:
+        wanted = {
+            normalize_symbol(code).provider_symbol for code in codes
+        }
+        names: dict[str, str] = {}
+        for index in range(self.stock_list.count()):
+            item = self.stock_list.item(index)
+            code = str(item.data(Qt.ItemDataRole.UserRole))
+            symbol = normalize_symbol(code)
+            name = str(item.data(STOCK_NAME_ITEM_ROLE) or "").strip()
+            if symbol.provider_symbol in wanted and name:
+                names[symbol.provider_symbol] = name
+        return names
+
     def _update_import_button(self) -> None:
         self.import_button.setEnabled(bool(self._checked_codes()))
         candidates = self._available_codes()
@@ -796,12 +857,14 @@ class FutuWatchlistImportDialog(QDialog):
     def _accept_selected(self) -> None:
         self.selected_codes = self._checked_codes()
         if self.selected_codes:
+            self.selected_names = self._names_for_codes(self.selected_codes)
             self.accept()
 
     @Slot()
     def _import_all_available(self) -> None:
         self.selected_codes = self._available_codes()[: self.available_slots]
         if self.selected_codes:
+            self.selected_names = self._names_for_codes(self.selected_codes)
             self.accept()
 
 
@@ -816,6 +879,7 @@ class WatchlistDialog(QDialog):
         alerts_enabled: bool,
         provider: HybridQuoteProvider | None = None,
         checked_watchlist: list[str] | None = None,
+        stock_names: dict[str, str] | None = None,
         theme: str = "dark",
         parent: QWidget | None = None,
     ) -> None:
@@ -823,7 +887,11 @@ class WatchlistDialog(QDialog):
         _load_ui_fonts()
         self.provider = provider
         self.theme = theme
-        self.saved_config: tuple[list[str], float, int, bool, list[str]] | None = None
+        self.stock_names = _normalize_stock_names(stock_names or {})
+        self._name_task: WatchlistNamesTask | None = None
+        self.saved_config: tuple[
+            list[str], float, int, bool, list[str], dict[str, str]
+        ] | None = None
         self.setWindowTitle("自选与提醒设置")
         self.setModal(True)
         self.setMinimumSize(430, 420)
@@ -1015,6 +1083,7 @@ class WatchlistDialog(QDialog):
             QPushButton#saveButton:hover { background: #3b7de7; }
             """
         self.setStyleSheet(dialog_stylesheet)
+        self._start_missing_name_lookup()
 
     @Slot(int)
     def _update_interval_value(self, index: int) -> None:
@@ -1051,6 +1120,44 @@ class WatchlistDialog(QDialog):
                 return item
         return None
 
+    def _watchlist_item_text(self, symbol) -> str:
+        name = self.stock_names.get(symbol.provider_symbol, "")
+        return (
+            f"{name}  ·  {symbol.display_code}  ·  {symbol.market_label}"
+            if name
+            else f"{symbol.display_code}  ·  {symbol.market_label}"
+        )
+
+    def _start_missing_name_lookup(self) -> None:
+        if self.provider is None or not hasattr(self.provider, "tencent"):
+            return
+        missing = [
+            code
+            for code in self._all_watchlist_codes()
+            if normalize_symbol(code).provider_symbol not in self.stock_names
+        ]
+        if not missing:
+            return
+        self.import_status_label.setText(f"正在补全 {len(missing)} 只股票名称…")
+        task = WatchlistNamesTask(self.provider.tencent, missing)
+        task.signals.finished.connect(self._on_name_lookup_finished)
+        self._name_task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_name_lookup_finished(self, payload: tuple[dict[str, str], str]) -> None:
+        names, error = payload
+        self._name_task = None
+        if names:
+            self.stock_names.update(_normalize_stock_names(names))
+            for index in range(self.stock_list.count()):
+                item = self.stock_list.item(index)
+                symbol = normalize_symbol(str(item.data(Qt.ItemDataRole.UserRole)))
+                item.setText(self._watchlist_item_text(symbol))
+            self.import_status_label.setText(f"已补全 {len(names)} 只股票名称。")
+        elif error:
+            self.import_status_label.setText("股票名称暂未补全，稍后打开会自动重试。")
+
     def _append_watchlist_item(self, raw_symbol: str, *, checked: bool = True) -> bool:
         normalized = normalize_watchlist([raw_symbol])
         if not normalized:
@@ -1058,13 +1165,14 @@ class WatchlistDialog(QDialog):
         symbol = normalize_symbol(normalized[0])
         existing = self._find_watchlist_item(symbol.provider_symbol)
         if existing is not None:
+            existing.setText(self._watchlist_item_text(symbol))
             if checked and existing.checkState() != Qt.CheckState.Checked:
                 existing.setCheckState(Qt.CheckState.Checked)
             self.stock_list.setCurrentItem(existing)
             return False
         if self.stock_list.count() >= MAX_WATCHLIST_ITEMS:
             return False
-        item = QListWidgetItem(f"{symbol.display_code}  ·  {symbol.market_label}")
+        item = QListWidgetItem(self._watchlist_item_text(symbol))
         item.setData(Qt.ItemDataRole.UserRole, symbol.code)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
@@ -1102,6 +1210,9 @@ class WatchlistDialog(QDialog):
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selected_codes:
             return
+        self.stock_names.update(
+            _normalize_stock_names(getattr(dialog, "selected_names", {}))
+        )
         imported_count = 0
         for code in dialog.selected_codes:
             if self._append_watchlist_item(code):
@@ -1127,6 +1238,7 @@ class WatchlistDialog(QDialog):
             self.INTERVAL_OPTIONS[self.interval.value()],
             bool(self.alerts_enabled.isChecked()),
             catalog,
+            dict(self.stock_names),
         )
         self.accept()
 
@@ -1462,8 +1574,15 @@ class QuotePanel(QWidget):
             )
         except SymbolError:
             self.watchlist_catalog = list(self.watchlist)
+        self.stock_names = _normalize_stock_names(
+            settings.value(STOCK_NAME_CACHE_SETTINGS_KEY, "{}")
+        )
         settings.setValue("watchlist", self.watchlist)
         settings.setValue("watchlist_catalog", self.watchlist_catalog)
+        settings.setValue(
+            STOCK_NAME_CACHE_SETTINGS_KEY,
+            json.dumps(self.stock_names, ensure_ascii=False),
+        )
         settings.sync()
         self.alert_threshold = float(settings.value("alert_threshold", 3.0))
         self.interval_seconds = int(settings.value("alert_interval_seconds", 60))
@@ -1956,6 +2075,13 @@ class QuotePanel(QWidget):
         self._search_task = None
         current_text = self.symbol_input.text().strip()
         if current_text == keyword:
+            names_changed = False
+            for result in results:
+                if self.stock_names.get(result.symbol.provider_symbol) != result.name:
+                    self.stock_names[result.symbol.provider_symbol] = result.name
+                    names_changed = True
+            if names_changed:
+                self._persist_stock_names()
             self._search_display_to_symbol = {
                 f"{result.name} · {result.symbol.display_code} · {result.symbol.market_label}": result.symbol.code
                 for result in results
@@ -2344,8 +2470,14 @@ class QuotePanel(QWidget):
 
     def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
         selected_symbol = self._current_input_symbol()
+        names_changed = False
         for quote in quotes:
             self._quote_cache[quote.symbol.provider_symbol] = quote
+            if quote.name and self.stock_names.get(quote.symbol.provider_symbol) != quote.name:
+                self.stock_names[quote.symbol.provider_symbol] = quote.name
+                names_changed = True
+        if names_changed:
+            self._persist_stock_names()
         self._refresh_watchlist_lists()
         self._select_symbol_in_current_list(selected_symbol)
         self._update_market_summary()
@@ -2389,6 +2521,7 @@ class QuotePanel(QWidget):
             self.alerts_enabled,
             provider=self.provider,
             checked_watchlist=self.watchlist,
+            stock_names=self.stock_names,
             theme=self.current_theme,
             parent=self,
         )
@@ -2413,14 +2546,21 @@ class QuotePanel(QWidget):
         interval_seconds: int,
         alerts_enabled: bool,
         catalog: list[str] | None = None,
+        stock_names: dict[str, str] | None = None,
     ) -> None:
         self.watchlist = watchlist
         self.watchlist_catalog = normalize_watchlist(catalog or watchlist)
+        if stock_names is not None:
+            self.stock_names.update(_normalize_stock_names(stock_names))
         self.alert_threshold = threshold
         self.interval_seconds = interval_seconds
         self.alerts_enabled = alerts_enabled
         self.settings.setValue("watchlist", watchlist)
         self.settings.setValue("watchlist_catalog", self.watchlist_catalog)
+        self.settings.setValue(
+            STOCK_NAME_CACHE_SETTINGS_KEY,
+            json.dumps(self.stock_names, ensure_ascii=False),
+        )
         self.settings.setValue("alert_threshold", threshold)
         self.settings.setValue("alert_interval_seconds", interval_seconds)
         self.settings.setValue("alerts_enabled", alerts_enabled)
@@ -2428,6 +2568,13 @@ class QuotePanel(QWidget):
         self._refresh_watchlist_lists()
         self._update_monitor_label()
         self.watchlist_changed.emit(watchlist, threshold, interval_seconds, alerts_enabled)
+
+    def _persist_stock_names(self) -> None:
+        self.settings.setValue(
+            STOCK_NAME_CACHE_SETTINGS_KEY,
+            json.dumps(self.stock_names, ensure_ascii=False),
+        )
+        self.settings.sync()
 
     def _update_monitor_label(self) -> None:
         state = "提醒开" if self.alerts_enabled else "提醒关"

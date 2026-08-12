@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from stock_pet.quote_provider import QuoteError, parse_tencent_payload
+from stock_pet.quote_provider import QuoteError, TencentQuoteProvider, parse_tencent_payload
 from stock_pet.symbols import normalize_symbol
 
 
@@ -11,6 +11,28 @@ def payload(fields: list[str], variable: str) -> str:
 
 
 class QuoteParserTests(unittest.TestCase):
+    def test_fetch_many_returns_names_for_multiple_markets_in_one_request(self) -> None:
+        hk_fields = [""] * 78
+        hk_fields[1] = "小米集团-W"
+        hk_fields[3] = hk_fields[4] = "28.0"
+        a_fields = [""] * 88
+        a_fields[1] = "半导体设备ETF国泰"
+        a_fields[3] = a_fields[4] = "0.7"
+        requested: list[str] = []
+
+        def transport(url: str) -> bytes:
+            requested.append(url)
+            return (
+                payload(hk_fields, "hk01810")
+                + "\n"
+                + payload(a_fields, "sz159516")
+            ).encode("gb18030")
+
+        quotes = TencentQuoteProvider(transport=transport).fetch_many(["01810", "159516"])
+
+        self.assertEqual([quote.name for quote in quotes], ["小米集团-W", "半导体设备ETF国泰"])
+        self.assertIn("hk01810,sz159516", requested[0])
+
     def test_parse_hk_quote(self) -> None:
         fields = [""] * 78
         fields[1] = "腾讯控股"

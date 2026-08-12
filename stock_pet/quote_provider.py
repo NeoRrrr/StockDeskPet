@@ -45,6 +45,43 @@ class TencentQuoteProvider:
             raise QuoteError(f"行情网络请求失败：{exc}") from exc
         return parse_tencent_payload(payload, symbol)
 
+    def fetch_many(self, raw_symbols: list[str]) -> list[Quote]:
+        """Fetch several quotes in one request, returning any rows that parse."""
+        symbols: list[StockSymbol] = []
+        seen: set[str] = set()
+        for raw_symbol in raw_symbols:
+            symbol = normalize_symbol(raw_symbol)
+            if symbol.provider_symbol in seen:
+                continue
+            seen.add(symbol.provider_symbol)
+            symbols.append(symbol)
+        if not symbols:
+            return []
+
+        quotes: list[Quote] = []
+        for start in range(0, len(symbols), 50):
+            chunk = symbols[start : start + 50]
+            url = self.endpoint.format(
+                symbol=",".join(symbol.provider_symbol for symbol in chunk)
+            )
+            try:
+                payload = self._transport(url).decode("gb18030", errors="replace")
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                raise QuoteError(f"行情网络请求失败：{exc}") from exc
+            rows = {
+                key.lower(): value
+                for key, value in re.findall(r'v_([^=\s]+)\s*=\s*"([^"]*)"', payload)
+            }
+            for symbol in chunk:
+                value = rows.get(symbol.provider_symbol.lower())
+                if not value:
+                    continue
+                try:
+                    quotes.append(parse_tencent_payload(f'="{value}"', symbol))
+                except QuoteError:
+                    continue
+        return quotes
+
     def search(self, query: str, limit: int = 8) -> list[StockSearchResult]:
         keyword = (query or "").strip()
         if not keyword:

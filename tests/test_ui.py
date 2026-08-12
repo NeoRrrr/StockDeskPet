@@ -114,6 +114,54 @@ class QuotePanelTests(unittest.TestCase):
         self.assertFalse(hasattr(dialog, "stock_add_input"))
         dialog.close()
 
+    def test_watchlist_dialog_shows_cached_stock_name_code_and_market(self) -> None:
+        dialog = WatchlistDialog(
+            ["00700", "159516"],
+            3.0,
+            60,
+            True,
+            stock_names={
+                "00700": "腾讯控股",
+                "SZ159516": "半导体设备ETF国泰",
+            },
+        )
+
+        self.assertEqual(
+            dialog.stock_list.item(0).text(),
+            "腾讯控股  ·  00700.HK  ·  港股",
+        )
+        self.assertEqual(
+            dialog.stock_list.item(1).text(),
+            "半导体设备ETF国泰  ·  SZ159516  ·  深市",
+        )
+        dialog.close()
+
+    def test_watchlist_dialog_backfills_missing_names_in_background(self) -> None:
+        class ProviderStub:
+            tencent = TencentQuoteProvider()
+
+        with patch("stock_pet.ui.QThreadPool.globalInstance") as thread_pool:
+            dialog = WatchlistDialog(
+                ["00700", "159516"],
+                3.0,
+                60,
+                True,
+                provider=ProviderStub(),  # type: ignore[arg-type]
+                stock_names={"00700": "腾讯控股"},
+            )
+            task = thread_pool.return_value.start.call_args.args[0]
+            self.assertEqual(task.symbols, ["159516"])
+            self.assertIn("正在补全 1 只", dialog.import_status_label.text())
+
+            dialog._on_name_lookup_finished(
+                ({"sz159516": "半导体设备ETF国泰"}, "")
+            )
+            self.assertEqual(
+                dialog.stock_list.item(1).text(),
+                "半导体设备ETF国泰  ·  SZ159516  ·  深市",
+            )
+            dialog.close()
+
     def test_unchecked_watchlist_items_remain_in_catalog_after_save(self) -> None:
         dialog = WatchlistDialog(
             ["00700", "159516"],
