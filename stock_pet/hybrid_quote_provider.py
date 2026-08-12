@@ -12,6 +12,11 @@ from .symbols import normalize_symbol
 
 
 FUTU_RETRY_SECONDS = 30.0
+INTERACTIVE_LOCK_TIMEOUT_SECONDS = 0.15
+
+
+class FutuBusyError(QuoteError):
+    """Raised when a foreground quote should not wait behind background polling."""
 
 
 def futu_code_for(symbol: StockSymbol) -> str | None:
@@ -67,13 +72,20 @@ class FutuQuoteProvider:
     def supports(self, symbol: StockSymbol) -> bool:
         return futu_code_for(symbol) is not None
 
-    def fetch(self, raw_symbol: str) -> Quote:
+    def fetch(self, raw_symbol: str, *, lock_timeout: float | None = None) -> Quote:
         symbol = normalize_symbol(raw_symbol)
         code = futu_code_for(symbol)
         if code is None:
             raise QuoteError(f"富途暂不支持 {symbol.display_code}，已切换备用行情。")
 
-        with self._lock:
+        if lock_timeout is None:
+            acquired = self._lock.acquire()
+        else:
+            acquired = self._lock.acquire(timeout=max(0.0, lock_timeout))
+        if not acquired:
+            raise FutuBusyError("富途正在后台刷新")
+
+        try:
             context = self._ensure_context()
             if code not in self._subscribed:
                 ret, message = context.subscribe(
@@ -94,6 +106,8 @@ class FutuQuoteProvider:
             if data is None or getattr(data, "empty", True):
                 raise QuoteError(f"富途没有返回 {symbol.display_code} 的行情。")
             return quote_from_futu_row(data.iloc[0], symbol)
+        finally:
+            self._lock.release()
 
     def check_status(self) -> tuple[bool, str]:
         with self._lock:
@@ -172,6 +186,32 @@ class HybridQuoteProvider:
         if self.mode == "auto" and futu_supported and self._can_retry_futu():
             try:
                 quote = self.futu.fetch(raw_symbol)
+            except Exception as exc:
+                self._mark_futu_failure(exc)
+            else:
+                with self._state_lock:
+                    self._last_futu_error = "OpenD 已连接，正在使用实时行情"
+                    self._retry_after = 0.0
+                return quote
+
+        quote = self.tencent.fetch(raw_symbol)
+        if self.mode == "auto" and futu_supported:
+            quote = replace(quote, source="腾讯行情（富途不可用，港股可能延迟）")
+        return quote
+
+    def fetch_interactive(self, raw_symbol: str) -> Quote:
+        """Fetch a user-selected quote without waiting behind background batches."""
+        symbol = normalize_symbol(raw_symbol)
+        futu_supported = self.futu.supports(symbol)
+        if self.mode == "auto" and futu_supported and self._can_retry_futu():
+            try:
+                quote = self.futu.fetch(
+                    raw_symbol,
+                    lock_timeout=INTERACTIVE_LOCK_TIMEOUT_SECONDS,
+                )
+            except FutuBusyError:
+                quote = self.tencent.fetch(raw_symbol)
+                return replace(quote, source="腾讯行情（富途后台刷新中）")
             except Exception as exc:
                 self._mark_futu_failure(exc)
             else:

@@ -97,6 +97,58 @@ class HybridQuoteProviderTests(unittest.TestCase):
         self.assertIn("富途不可用", result.source)
         self.assertIn("OpenD 未连接", provider.status_text())
 
+    def test_interactive_fetch_falls_back_immediately_when_futu_is_busy(self) -> None:
+        symbol = normalize_symbol("01810")
+        fallback_quote = Quote(
+            symbol=symbol,
+            name="小米集团-W",
+            price=28.0,
+            previous_close=27.5,
+            open_price=27.8,
+            high=28.2,
+            low=27.6,
+            change=0.5,
+            change_percent=1.81,
+            volume=1.0,
+            volume_unit="手",
+            amount=1.0,
+            quote_time="2026-08-11 14:00:00",
+            source="腾讯行情",
+        )
+
+        class BusyFutu:
+            def supports(self, _symbol) -> bool:
+                return True
+
+            def fetch(self, _raw_symbol: str, *, lock_timeout=None) -> Quote:
+                from stock_pet.hybrid_quote_provider import FutuBusyError
+
+                self.lock_timeout = lock_timeout
+                raise FutuBusyError("富途正在后台刷新")
+
+            def close(self) -> None:
+                pass
+
+        class TencentFallback:
+            def fetch(self, _raw_symbol: str) -> Quote:
+                return fallback_quote
+
+            def search(self, _query: str, limit: int = 8) -> list:
+                return []
+
+        futu = BusyFutu()
+        provider = HybridQuoteProvider(
+            mode="auto",
+            tencent=TencentFallback(),  # type: ignore[arg-type]
+            futu=futu,  # type: ignore[arg-type]
+        )
+
+        result = provider.fetch_interactive("01810")
+
+        self.assertEqual(result.price, fallback_quote.price)
+        self.assertIn("富途后台刷新中", result.source)
+        self.assertGreater(futu.lock_timeout, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

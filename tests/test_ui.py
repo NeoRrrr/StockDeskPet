@@ -160,6 +160,55 @@ class QuotePanelTests(unittest.TestCase):
             self.assertEqual(panel.price_label.styleSheet(), panel.change_label.styleSheet())
             panel.close()
 
+    def test_cached_detail_is_immediate_and_latest_click_is_queued(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            settings.setValue("watchlist", ["159516", "515880"])
+            panel = QuotePanel(TencentQuoteProvider(), settings)
+
+            def quote(raw_symbol: str, name: str, price: float) -> Quote:
+                return Quote(
+                    symbol=normalize_symbol(raw_symbol),
+                    name=name,
+                    price=price,
+                    previous_close=price,
+                    open_price=price,
+                    high=price,
+                    low=price,
+                    change=0.0,
+                    change_percent=0.0,
+                    volume=1.0,
+                    volume_unit="手",
+                    amount=1.0,
+                    quote_time="2026-08-12 10:00:00",
+                    source="缓存测试",
+                )
+
+            first = quote("159516", "半导体设备ETF", 0.701)
+            second = quote("515880", "通信ETF", 1.234)
+            panel.update_watchlist_quotes([first, second])
+
+            with patch.object(panel.thread_pool, "start") as start:
+                panel.fetch_symbol("159516")
+                first_task = panel._active_task
+                self.assertIsNotNone(first_task)
+                self.assertIn("0.701", panel.price_label.text())
+
+                panel.fetch_symbol("515880")
+                self.assertIn("1.234", panel.price_label.text())
+                self.assertEqual(panel._pending_fetch_symbol, "515880")
+                self.assertEqual(start.call_count, 1)
+
+                panel._on_quote(first_task, first)  # type: ignore[arg-type]
+                self.assertIsNotNone(panel._active_task)
+                self.assertEqual(panel._active_task.symbol, "515880")
+                self.assertEqual(start.call_count, 2)
+
+            panel._active_task = None
+            panel.close()
+
     def test_item_favorite_button_and_panel_opacity_are_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)

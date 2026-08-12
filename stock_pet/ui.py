@@ -231,7 +231,12 @@ class FetchTask(QRunnable):
     @Slot()
     def run(self) -> None:
         try:
-            quote = self.provider.fetch(self.symbol)
+            interactive_fetch = getattr(self.provider, "fetch_interactive", None)
+            quote = (
+                interactive_fetch(self.symbol)
+                if callable(interactive_fetch)
+                else self.provider.fetch(self.symbol)
+            )
         except Exception as exc:
             self.signals.failed.emit(str(exc))
             return
@@ -1008,6 +1013,7 @@ class QuotePanel(QWidget):
         self.settings = settings
         self.thread_pool = QThreadPool.globalInstance()
         self._active_task: FetchTask | None = None
+        self._pending_fetch_symbol: str | None = None
         self._search_task: SearchTask | None = None
         self._pending_search_text = ""
         self._search_display_to_symbol: dict[str, str] = {}
@@ -1566,6 +1572,8 @@ class QuotePanel(QWidget):
         normalized = normalize_symbol(symbol)
         quote = self._quote_cache.get(normalized.provider_symbol)
         self._set_symbol_input_display(symbol, quote.name if quote else "")
+        if quote is not None:
+            self._display_quote(quote)
         self.fetch_quote()
 
     def _on_watchlist_item_clicked(self, item: QListWidgetItem) -> None:
@@ -2005,26 +2013,91 @@ class QuotePanel(QWidget):
 
     @Slot()
     def fetch_quote(self) -> None:
-        if self._active_task is not None:
-            return
         symbol = self._current_input_symbol()
         if not symbol:
             self._show_error("请输入股票代码。")
             return
 
-        self.status_label.setText("正在请求最新可用行情…")
+        try:
+            symbol_key = normalize_symbol(symbol).provider_symbol
+        except SymbolError as exc:
+            self._show_error(str(exc))
+            return
+
+        cached_quote = self._quote_cache.get(symbol_key)
+        if cached_quote is not None:
+            self._display_quote(cached_quote)
+
+        if self._active_task is not None:
+            self._pending_fetch_symbol = symbol
+            self.status_label.setText(
+                "已显示最近行情，正在等待更新…"
+                if cached_quote is not None
+                else "已记录当前选择，正在等待行情请求…"
+            )
+            return
+
+        self._start_quote_fetch(symbol, cached_quote is not None)
+
+    def _start_quote_fetch(self, symbol: str, has_cached_quote: bool = False) -> None:
+        self.status_label.setText(
+            "已显示最近行情，正在后台更新…"
+            if has_cached_quote
+            else "正在请求最新可用行情…"
+        )
         self.loading_changed.emit(True)
 
         task = FetchTask(self.provider, symbol)
-        task.signals.finished.connect(self._on_quote)
-        task.signals.failed.connect(self._show_error)
+        task.signals.finished.connect(
+            lambda quote, active_task=task: self._on_quote(active_task, quote)
+        )
+        task.signals.failed.connect(
+            lambda message, active_task=task: self._on_fetch_error(active_task, message)
+        )
         self._active_task = task
         self.thread_pool.start(task)
 
-    @Slot(object)
-    def _on_quote(self, quote: Quote) -> None:
-        self._finish_loading()
+    def _on_quote(self, task: FetchTask, quote: Quote) -> None:
+        if task is not self._active_task:
+            return
+        self._active_task = None
         self.update_watchlist_quotes([quote])
+        self._continue_pending_fetch(task.symbol)
+
+    def _on_fetch_error(self, task: FetchTask, message: str) -> None:
+        if task is not self._active_task:
+            return
+        self._active_task = None
+        pending = self._pending_fetch_symbol
+        if pending:
+            self._continue_pending_fetch(task.symbol)
+            return
+
+        try:
+            key = normalize_symbol(task.symbol).provider_symbol
+        except SymbolError:
+            key = ""
+        if key and key in self._quote_cache:
+            self.status_label.setText(f"最新行情更新失败，继续显示最近数据\n{message}")
+            self.loading_changed.emit(False)
+            return
+        self._show_error(message)
+
+    def _continue_pending_fetch(self, completed_symbol: str) -> None:
+        pending = self._pending_fetch_symbol
+        self._pending_fetch_symbol = None
+        if pending:
+            try:
+                pending_key = normalize_symbol(pending).provider_symbol
+                completed_key = normalize_symbol(completed_symbol).provider_symbol
+            except SymbolError:
+                pending_key = pending
+                completed_key = completed_symbol
+            if pending_key != completed_key:
+                cached = self._quote_cache.get(pending_key)
+                self._start_quote_fetch(pending, cached is not None)
+                return
+        self.loading_changed.emit(False)
 
     def _display_quote(self, quote: Quote) -> None:
         self._set_symbol_input_display(quote.symbol.code, quote.name)
@@ -2065,6 +2138,7 @@ class QuotePanel(QWidget):
 
     def _finish_loading(self) -> None:
         self._active_task = None
+        self._pending_fetch_symbol = None
         self.loading_changed.emit(False)
 
     def place_near(self, pet: QWidget) -> None:
