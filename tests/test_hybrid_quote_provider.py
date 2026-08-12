@@ -6,12 +6,32 @@ from stock_pet.hybrid_quote_provider import (
     HybridQuoteProvider,
     futu_code_for,
     quote_from_futu_row,
+    watchlist_entries_from_futu_data,
 )
 from stock_pet.models import Quote
 from stock_pet.symbols import normalize_symbol
 
 
 class HybridQuoteProviderTests(unittest.TestCase):
+    def test_futu_watchlist_conversion_keeps_only_supported_stocks_and_etfs(self) -> None:
+        class Rows:
+            empty = False
+
+            def iterrows(self):
+                rows = [
+                    {"code": "HK.00700", "name": "腾讯控股", "stock_type": "STOCK"},
+                    {"code": "SZ.159516", "name": "半导体设备ETF", "stock_type": "ETF"},
+                    {"code": "HK.800000", "name": "恒生指数", "stock_type": "IDX"},
+                    {"code": "US.AAPL", "name": "Apple", "stock_type": "STOCK"},
+                    {"code": "HK.00700", "name": "腾讯控股", "stock_type": "STOCK"},
+                ]
+                return enumerate(rows)
+
+        self.assertEqual(
+            watchlist_entries_from_futu_data(Rows()),
+            [("00700", "腾讯控股"), ("159516", "半导体设备ETF")],
+        )
+
     def test_futu_code_mapping_uses_official_market_prefixes(self) -> None:
         self.assertEqual(futu_code_for(normalize_symbol("00700")), "HK.00700")
         self.assertEqual(futu_code_for(normalize_symbol("600519")), "SH.600519")

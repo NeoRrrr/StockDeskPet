@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QComboBox, QLabel, QLineEdit, QPushButton, QSlider
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QPushButton, QSlider
 
 from stock_pet import __version__
 from stock_pet.models import Quote
@@ -23,6 +23,7 @@ from stock_pet.ui import (
     FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
     FAVORITE_REFRESH_INTERVAL_MS,
     FavoriteButton,
+    FutuWatchlistImportDialog,
     INDEX_SYMBOLS,
     MARKET_TIMEZONE,
     OPEN_TAB_REFRESH_INTERVAL_MS,
@@ -31,6 +32,7 @@ from stock_pet.ui import (
     QuotePanel,
     StockPetWidget,
     ThemeSwitch,
+    WatchlistDialog,
     _is_open_for_automatic_refresh,
     _is_visible_in_idle_bubble,
 )
@@ -44,6 +46,75 @@ class QuotePanelTests(unittest.TestCase):
     def test_packaged_app_icon_assets_are_readable(self) -> None:
         self.assertFalse(QIcon(str(asset_path("app_icon.png"))).isNull())
         self.assertFalse(QIcon(str(asset_path("app_icon.ico"))).isNull())
+
+    def test_futu_import_dialog_respects_existing_items_and_remaining_slots(self) -> None:
+        existing = [f"0000{index:02d}" for index in range(1, 20)]
+        with patch("stock_pet.ui.QThreadPool.globalInstance"):
+            dialog = FutuWatchlistImportDialog(
+                TencentQuoteProvider(),  # type: ignore[arg-type]
+                existing,
+            )
+            dialog._on_task_result(("groups", "", ["全部", "港股"], ""))
+            dialog._on_task_result(
+                (
+                    "entries",
+                    "全部",
+                    [("000001", "平安银行"), ("00700", "腾讯控股"), ("01810", "小米集团-W")],
+                    "",
+                )
+            )
+
+            self.assertEqual(dialog.available_slots, 1)
+            self.assertEqual(dialog.stock_list.count(), 3)
+            self.assertEqual(dialog._checked_codes(), ["00700"])
+            self.assertFalse(dialog.stock_list.item(0).flags() & Qt.ItemFlag.ItemIsEnabled)
+            self.assertTrue(dialog.import_button.isEnabled())
+            self.assertEqual(dialog.one_click_button.text(), "一键导入前 1 只")
+            dialog._import_all_available()
+            self.assertEqual(dialog.selected_codes, ["00700"])
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            dialog.close()
+
+    def test_watchlist_dialog_merges_selected_futu_items(self) -> None:
+        class ImportDialogStub:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.selected_codes = ["01810", "600519"]
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch("stock_pet.ui.FutuWatchlistImportDialog", ImportDialogStub):
+            dialog = WatchlistDialog(
+                ["00700"],
+                3.0,
+                60,
+                True,
+                provider=TencentQuoteProvider(),  # type: ignore[arg-type]
+            )
+            dialog._import_futu_watchlist()
+            self.assertEqual(
+                dialog._checked_watchlist_codes(),
+                ["00700", "01810", "600519"],
+            )
+            self.assertIn("已从富途合并 2 只", dialog.import_status_label.text())
+            dialog.close()
+
+    def test_watchlist_dialog_supports_checkbox_plus_and_minus_editing(self) -> None:
+        dialog = WatchlistDialog(["00700", "159516"], 3.0, 60, True)
+        self.assertEqual(dialog.stock_list.count(), 2)
+        self.assertEqual(dialog._checked_watchlist_codes(), ["00700", "159516"])
+
+        dialog.stock_list.item(1).setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(dialog._checked_watchlist_codes(), ["00700"])
+        dialog.stock_add_input.setText("01810")
+        dialog._add_stock_item()
+        self.assertEqual(dialog._checked_watchlist_codes(), ["00700", "01810"])
+
+        dialog.stock_list.setCurrentItem(dialog.stock_list.item(0))
+        dialog._remove_selected_stock_items()
+        self.assertEqual(dialog._checked_watchlist_codes(), ["01810"])
+        self.assertEqual(dialog.watchlist_count_label.text(), "已勾选 1/20")
+        dialog.close()
 
     def test_current_tab_refresh_emits_only_visible_market(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

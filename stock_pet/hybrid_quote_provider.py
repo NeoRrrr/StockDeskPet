@@ -13,6 +13,8 @@ from .symbols import normalize_symbol
 
 FUTU_RETRY_SECONDS = 30.0
 INTERACTIVE_LOCK_TIMEOUT_SECONDS = 0.15
+FUTU_WATCHLIST_STOCK_TYPES = {"STOCK", "ETF"}
+FUTU_WATCHLIST_MARKETS = {"HK", "SH", "SZ", "BJ"}
 
 
 class FutuBusyError(QuoteError):
@@ -57,6 +59,32 @@ def quote_from_futu_row(row: Any, symbol: StockSymbol) -> Quote:
         source="富途 OpenD（实时行情）",
         turnover_rate=turnover_rate,
     )
+
+
+def watchlist_entries_from_futu_data(data: Any) -> list[tuple[str, str]]:
+    """Convert Futu watchlist rows to supported A-share/HK stock entries."""
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    if data is None or getattr(data, "empty", True):
+        return entries
+    for _, row in data.iterrows():
+        futu_code = str(_row_value(row, "code", "")).strip().upper()
+        stock_type = str(_row_value(row, "stock_type", "")).strip().upper()
+        if "." not in futu_code or stock_type not in FUTU_WATCHLIST_STOCK_TYPES:
+            continue
+        market, digits = futu_code.split(".", 1)
+        if market not in FUTU_WATCHLIST_MARKETS or not digits.isdigit():
+            continue
+        try:
+            symbol = normalize_symbol(f"{market}{digits}")
+        except Exception:
+            continue
+        if symbol.provider_symbol in seen:
+            continue
+        seen.add(symbol.provider_symbol)
+        name = str(_row_value(row, "name", "")).strip() or symbol.display_code
+        entries.append((symbol.code, name))
+    return entries
 
 
 class FutuQuoteProvider:
@@ -123,6 +151,29 @@ class FutuQuoteProvider:
             remain = data.get("remain") if isinstance(data, dict) else None
             suffix = f" · 剩余订阅额度 {remain}" if remain is not None else ""
             return True, f"OpenD 已连接{suffix}"
+
+    def list_watchlist_groups(self) -> list[str]:
+        with self._lock:
+            context = self._ensure_context()
+            ret, data = context.get_user_security_group()
+            if ret != self._ret_ok:
+                raise QuoteError(f"富途自选分组读取失败：{data}")
+            if data is None or getattr(data, "empty", True):
+                return []
+            groups: list[str] = []
+            for value in data.get("group_name", []):
+                name = str(value).strip()
+                if name and name not in groups:
+                    groups.append(name)
+            return groups
+
+    def get_watchlist_group(self, group_name: str) -> list[tuple[str, str]]:
+        with self._lock:
+            context = self._ensure_context()
+            ret, data = context.get_user_security(group_name)
+            if ret != self._ret_ok:
+                raise QuoteError(f"富途自选读取失败：{data}")
+            return watchlist_entries_from_futu_data(data)
 
     def close(self) -> None:
         with self._lock:
@@ -237,6 +288,12 @@ class HybridQuoteProvider:
             if not ok:
                 self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
         return ok, message
+
+    def list_futu_watchlist_groups(self) -> list[str]:
+        return self.futu.list_watchlist_groups()
+
+    def get_futu_watchlist_group(self, group_name: str) -> list[tuple[str, str]]:
+        return self.futu.get_watchlist_group(group_name)
 
     def status_text(self) -> str:
         if self.mode == "tencent":

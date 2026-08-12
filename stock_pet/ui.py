@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
-    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSlider,
@@ -303,6 +302,31 @@ class ProviderStatusTask(QRunnable):
             self.signals.failed.emit(str(exc))
 
 
+class FutuWatchlistTask(QRunnable):
+    def __init__(
+        self,
+        provider: HybridQuoteProvider,
+        action: str,
+        group_name: str = "",
+    ) -> None:
+        super().__init__()
+        self.provider = provider
+        self.action = action
+        self.group_name = group_name
+        self.signals = FetchSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            if self.action == "groups":
+                data = self.provider.list_futu_watchlist_groups()
+            else:
+                data = self.provider.get_futu_watchlist_group(self.group_name)
+            self.signals.finished.emit((self.action, self.group_name, data, ""))
+        except Exception as exc:
+            self.signals.finished.emit((self.action, self.group_name, [], str(exc)))
+
+
 class UpdateTaskSignals(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -528,6 +552,253 @@ class ThemeSwitch(QAbstractButton):
         painter.drawEllipse(knob_x, 7, knob_size, knob_size)
 
 
+class FutuWatchlistImportDialog(QDialog):
+    MAX_WATCHLIST_ITEMS = 20
+
+    def __init__(
+        self,
+        provider: HybridQuoteProvider,
+        existing_watchlist: list[str],
+        theme: str = "dark",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        _load_ui_fonts()
+        self.provider = provider
+        self.existing_watchlist = normalize_watchlist(existing_watchlist)
+        self.existing_keys = {
+            normalize_symbol(code).provider_symbol for code in self.existing_watchlist
+        }
+        self.available_slots = max(0, self.MAX_WATCHLIST_ITEMS - len(self.existing_watchlist))
+        self.selected_codes: list[str] = []
+        self._task: FutuWatchlistTask | None = None
+        self._updating_items = False
+
+        self.setWindowTitle("从富途导入自选")
+        self.setModal(True)
+        self.setFixedSize(470, 520)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("从富途导入自选")
+        title.setObjectName("importTitle")
+        help_label = QLabel(
+            "只读取同一 OpenD 账号的自选，仅导入大A和港股，"
+            "不会修改富途手机端。"
+        )
+        help_label.setObjectName("importHelp")
+        help_label.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(help_label)
+
+        group_row = QHBoxLayout()
+        group_row.addWidget(QLabel("自选分组"))
+        self.group_combo = QComboBox()
+        self.group_combo.setEnabled(False)
+        self.group_combo.currentTextChanged.connect(self._load_selected_group)
+        group_row.addWidget(self.group_combo, 1)
+        layout.addLayout(group_row)
+
+        self.stock_list = QListWidget()
+        self.stock_list.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self.stock_list, 1)
+
+        self.status_label = QLabel(
+            f"当前还可导入 {self.available_slots} 只，正在读取富途自选分组…"
+        )
+        self.status_label.setObjectName("importStatus")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.import_button = buttons.button(QDialogButtonBox.StandardButton.Save)
+        self.import_button.setText("导入选中")
+        self.import_button.setObjectName("importButton")
+        self.import_button.setEnabled(False)
+        self.one_click_button = buttons.addButton(
+            "一键导入本组",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.one_click_button.setObjectName("oneClickImportButton")
+        self.one_click_button.setEnabled(False)
+        self.one_click_button.clicked.connect(self._import_all_available)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._accept_selected)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        stylesheet = """
+            QDialog { background:#0c1622; color:#c8d2df; }
+            QLabel { color:#c8d2df; font-family:"Noto Sans SC"; }
+            QLabel#importTitle { color:#eef4fb; font:600 18px "Microsoft YaHei UI"; }
+            QLabel#importHelp, QLabel#importStatus { color:#8797aa; font-size:12px; }
+            QComboBox, QListWidget {
+                color:#e6edf6; background:#111e2c; border:1px solid #324257;
+                border-radius:8px; padding:6px; font:12px "Noto Sans SC";
+            }
+            QListWidget::item { min-height:28px; padding:3px 5px; }
+            QListWidget::item:selected { background:#1d3f70; }
+            QPushButton { color:#b8c5d6; background:#111e2c; border:1px solid #324257;
+                border-radius:8px; padding:7px 16px; font:600 12px "Noto Sans SC"; }
+            QPushButton:hover { color:#eef5ff; border-color:#4b82de; }
+            QPushButton#importButton { color:white; background:#2467d8; border-color:#3b7ce8; }
+            QPushButton:disabled { color:#6f7e91; background:#172331; border-color:#29394c; }
+        """
+        if theme == "beige":
+            stylesheet += """
+                QDialog { background:#f6f8fb; color:#243247; }
+                QLabel { color:#243247; }
+                QLabel#importTitle { color:#17253a; }
+                QLabel#importHelp, QLabel#importStatus { color:#68778c; }
+                QComboBox, QListWidget { color:#1f2d42; background:#ffffff; border-color:#c6d2e1; }
+                QListWidget::item:selected { color:#ffffff; background:#2d6ed8; }
+                QPushButton { color:#40516a; background:#f0f4f9; border-color:#c6d2e1; }
+                QPushButton#importButton { color:white; background:#2d6ed8; border-color:#2d6ed8; }
+            """
+        self.setStyleSheet(stylesheet)
+        self._start_task("groups")
+
+    def _start_task(self, action: str, group_name: str = "") -> None:
+        if self._task is not None:
+            return
+        self.group_combo.setEnabled(False)
+        self.import_button.setEnabled(False)
+        self.one_click_button.setEnabled(False)
+        if action == "entries":
+            self.stock_list.clear()
+            self.status_label.setText(f"正在读取“{group_name}”…")
+        task = FutuWatchlistTask(self.provider, action, group_name)
+        task.signals.finished.connect(self._on_task_result)
+        self._task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_task_result(self, payload: tuple[str, str, list, str]) -> None:
+        action, group_name, data, error = payload
+        self._task = None
+        if error:
+            self.status_label.setText(error)
+            self.group_combo.setEnabled(self.group_combo.count() > 0)
+            return
+        if action == "groups":
+            groups = [str(group) for group in data if str(group).strip()]
+            if not groups:
+                self.status_label.setText("富途账号中没有可读取的自选分组。")
+                return
+            self.group_combo.blockSignals(True)
+            self.group_combo.clear()
+            self.group_combo.addItems(groups)
+            preferred_index = self.group_combo.findText("全部")
+            self.group_combo.setCurrentIndex(max(0, preferred_index))
+            self.group_combo.blockSignals(False)
+            self.group_combo.setEnabled(True)
+            self._load_selected_group(self.group_combo.currentText())
+            return
+        if group_name != self.group_combo.currentText():
+            return
+        self.group_combo.setEnabled(True)
+        self._populate_entries(data)
+
+    @Slot(str)
+    def _load_selected_group(self, group_name: str) -> None:
+        if group_name and self._task is None:
+            self._start_task("entries", group_name)
+
+    def _populate_entries(self, entries: list[tuple[str, str]]) -> None:
+        self._updating_items = True
+        self.stock_list.clear()
+        preselected = 0
+        for code, name in entries:
+            try:
+                symbol = normalize_symbol(code)
+            except SymbolError:
+                continue
+            existing = symbol.provider_symbol in self.existing_keys
+            suffix = "  ·  已在桌宠自选" if existing else ""
+            item = QListWidgetItem(f"{name}  ·  {symbol.display_code}{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, symbol.code)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            if existing:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+            elif preselected < self.available_slots:
+                item.setCheckState(Qt.CheckState.Checked)
+                preselected += 1
+            self.stock_list.addItem(item)
+        self._updating_items = False
+        if self.stock_list.count() == 0:
+            self.status_label.setText("该分组没有桌宠支持的大A或港股。")
+            self.import_button.setEnabled(False)
+            self.one_click_button.setEnabled(False)
+        else:
+            self._update_selection_status()
+
+    @Slot(QListWidgetItem)
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        if self._updating_items:
+            return
+        if item.checkState() == Qt.CheckState.Checked and len(self._checked_codes()) > self.available_slots:
+            self._updating_items = True
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self._updating_items = False
+            self.status_label.setText(
+                f"桌宠自选最多 {self.MAX_WATCHLIST_ITEMS} 只，"
+                f"当前最多还可选 {self.available_slots} 只。"
+            )
+            self._update_import_button()
+            return
+        self._update_selection_status()
+
+    def _checked_codes(self) -> list[str]:
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self.stock_list.count())
+            if (item := self.stock_list.item(index)).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _update_import_button(self) -> None:
+        self.import_button.setEnabled(bool(self._checked_codes()))
+        candidates = self._available_codes()
+        import_count = min(len(candidates), self.available_slots)
+        self.one_click_button.setEnabled(import_count > 0)
+        if import_count:
+            suffix = f"前 {import_count} 只" if len(candidates) > import_count else f"{import_count} 只"
+            self.one_click_button.setText(f"一键导入{suffix}")
+            self.one_click_button.setToolTip(
+                f"按当前列表顺序导入 {import_count} 只，已有自选会自动跳过"
+            )
+
+    def _available_codes(self) -> list[str]:
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self.stock_list.count())
+            if (item := self.stock_list.item(index)).flags() & Qt.ItemFlag.ItemIsEnabled
+        ]
+
+    def _update_selection_status(self) -> None:
+        selected_count = len(self._checked_codes())
+        self.status_label.setText(
+            f"该分组共 {self.stock_list.count()} 只可导入股票，"
+            f"已选 {selected_count} 只，剩余名额 {self.available_slots - selected_count} 只。"
+        )
+        self._update_import_button()
+
+    @Slot()
+    def _accept_selected(self) -> None:
+        self.selected_codes = self._checked_codes()
+        if self.selected_codes:
+            self.accept()
+
+    @Slot()
+    def _import_all_available(self) -> None:
+        self.selected_codes = self._available_codes()[: self.available_slots]
+        if self.selected_codes:
+            self.accept()
+
+
 class WatchlistDialog(QDialog):
     INTERVAL_OPTIONS = (30, 60, 120, 180, 300)
 
@@ -537,11 +808,14 @@ class WatchlistDialog(QDialog):
         threshold: float,
         interval_seconds: int,
         alerts_enabled: bool,
+        provider: HybridQuoteProvider | None = None,
         theme: str = "dark",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         _load_ui_fonts()
+        self.provider = provider
+        self.theme = theme
         self.saved_config: tuple[list[str], float, int, bool] | None = None
         self.setWindowTitle("自选与提醒设置")
         self.setModal(True)
@@ -554,16 +828,57 @@ class WatchlistDialog(QDialog):
         title = QLabel("自选与提醒设置")
         title.setObjectName("dialogTitle")
         help_label = QLabel(
-            "每行输入一个股票代码，最多 20 只。支持港股、沪市、深市和北交所。"
+            "滑动查看并勾选要保留的股票，最多 20 只。"
+            "支持港股、沪市、深市和北交所。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("dialogHelp")
-        self.stock_ids = QPlainTextEdit("\n".join(watchlist))
-        self.stock_ids.setPlaceholderText("00700\n600519\n000001")
-        self.stock_ids.setMinimumHeight(180)
         layout.addWidget(title)
         layout.addWidget(help_label)
-        layout.addWidget(self.stock_ids)
+
+        self.stock_list = QListWidget()
+        self.stock_list.setObjectName("watchlistEditor")
+        self.stock_list.setMinimumHeight(180)
+        self.stock_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        for code in normalize_watchlist(watchlist):
+            self._append_watchlist_item(code)
+        layout.addWidget(self.stock_list)
+
+        edit_row = QHBoxLayout()
+        self.stock_add_input = QLineEdit()
+        self.stock_add_input.setObjectName("watchlistAddInput")
+        self.stock_add_input.setPlaceholderText("输入股票代码，如 00700 / 600519")
+        self.stock_add_input.returnPressed.connect(self._add_stock_item)
+        self.add_stock_button = QPushButton("+")
+        self.add_stock_button.setObjectName("watchlistAddButton")
+        self.add_stock_button.setFixedWidth(42)
+        self.add_stock_button.setToolTip("添加股票")
+        self.add_stock_button.clicked.connect(self._add_stock_item)
+        self.remove_stock_button = QPushButton("−")
+        self.remove_stock_button.setObjectName("watchlistRemoveButton")
+        self.remove_stock_button.setFixedWidth(42)
+        self.remove_stock_button.setToolTip("删除当前选中的行")
+        self.remove_stock_button.clicked.connect(self._remove_selected_stock_items)
+        self.watchlist_count_label = QLabel("")
+        self.watchlist_count_label.setObjectName("dialogHelp")
+        edit_row.addWidget(self.stock_add_input, 1)
+        edit_row.addWidget(self.add_stock_button)
+        edit_row.addWidget(self.remove_stock_button)
+        edit_row.addWidget(self.watchlist_count_label)
+        layout.addLayout(edit_row)
+        self.stock_list.itemChanged.connect(self._update_watchlist_count)
+        self._update_watchlist_count()
+
+        import_row = QHBoxLayout()
+        self.futu_import_button = QPushButton("从富途导入")
+        self.futu_import_button.setObjectName("futuImportButton")
+        self.futu_import_button.clicked.connect(self._import_futu_watchlist)
+        self.futu_import_button.setVisible(provider is not None)
+        self.import_status_label = QLabel("")
+        self.import_status_label.setObjectName("dialogHelp")
+        import_row.addWidget(self.futu_import_button)
+        import_row.addWidget(self.import_status_label, 1)
+        layout.addLayout(import_row)
 
         form = QFormLayout()
         form.setVerticalSpacing(14)
@@ -650,10 +965,12 @@ class WatchlistDialog(QDialog):
             QLabel#dialogHelp { color: #8797aa; font-size: 12px; }
             QLabel#dialogError { color: #f05a5f; font-size: 12px; }
             QLabel#sliderValue { color: #aebed1; font: 600 12px "Noto Sans SC"; }
-            QPlainTextEdit {
+            QListWidget#watchlistEditor, QLineEdit#watchlistAddInput {
                 color: #e6edf6; background: #111e2c; border: 1px solid #324257;
                 border-radius: 8px; padding: 7px; font: 13px "Noto Sans SC";
             }
+            QListWidget#watchlistEditor::item { min-height: 27px; padding: 3px 5px; }
+            QListWidget#watchlistEditor::item:selected { background: #1d3f70; }
             QSlider#settingsSlider::groove:horizontal {
                 height: 5px; background: #29394c; border-radius: 2px;
             }
@@ -679,9 +996,10 @@ class WatchlistDialog(QDialog):
             QLabel#dialogTitle { color: #17253a; }
             QLabel#dialogHelp { color: #68778c; }
             QLabel#sliderValue { color: #40516a; }
-            QPlainTextEdit {
+            QListWidget#watchlistEditor, QLineEdit#watchlistAddInput {
                 color: #1f2d42; background: #ffffff; border-color: #c6d2e1;
             }
+            QListWidget#watchlistEditor::item:selected { color: #ffffff; background: #2d6ed8; }
             QSlider#settingsSlider::groove:horizontal { background: #d3dde9; }
             QSlider#settingsSlider::sub-page:horizontal { background: #2d6ed8; }
             QSlider#settingsSlider::handle:horizontal {
@@ -703,9 +1021,114 @@ class WatchlistDialog(QDialog):
             text = f"{seconds // 60} 分钟"
         self.interval_value.setText(text)
 
+    def _checked_watchlist_codes(self) -> list[str]:
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self.stock_list.count())
+            if (item := self.stock_list.item(index)).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _find_watchlist_item(self, provider_symbol: str) -> QListWidgetItem | None:
+        for index in range(self.stock_list.count()):
+            item = self.stock_list.item(index)
+            try:
+                item_key = normalize_symbol(
+                    str(item.data(Qt.ItemDataRole.UserRole))
+                ).provider_symbol
+            except SymbolError:
+                continue
+            if item_key == provider_symbol:
+                return item
+        return None
+
+    def _append_watchlist_item(self, raw_symbol: str, *, checked: bool = True) -> bool:
+        normalized = normalize_watchlist([raw_symbol])
+        if not normalized:
+            return False
+        symbol = normalize_symbol(normalized[0])
+        existing = self._find_watchlist_item(symbol.provider_symbol)
+        if existing is not None:
+            if checked and existing.checkState() != Qt.CheckState.Checked:
+                if len(self._checked_watchlist_codes()) >= 20:
+                    return False
+                existing.setCheckState(Qt.CheckState.Checked)
+            self.stock_list.setCurrentItem(existing)
+            return False
+        if checked and len(self._checked_watchlist_codes()) >= 20:
+            return False
+        item = QListWidgetItem(f"{symbol.display_code}  ·  {symbol.market_label}")
+        item.setData(Qt.ItemDataRole.UserRole, symbol.code)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.stock_list.addItem(item)
+        return True
+
+    @Slot()
+    def _add_stock_item(self) -> None:
+        raw_symbol = self.stock_add_input.text().strip()
+        if not raw_symbol:
+            self.error_label.setText("请先输入股票代码。")
+            return
+        try:
+            symbol = normalize_symbol(raw_symbol)
+            existing = self._find_watchlist_item(symbol.provider_symbol)
+            added = self._append_watchlist_item(raw_symbol)
+        except SymbolError as exc:
+            self.error_label.setText(str(exc))
+            return
+        if not added and existing is None and len(self._checked_watchlist_codes()) >= 20:
+            self.error_label.setText("自选股最多保存 20 只，请先取消勾选或删除一项。")
+            return
+        self.stock_add_input.clear()
+        self.error_label.clear()
+        self.import_status_label.setText(
+            f"已添加 {symbol.display_code}。" if added else f"{symbol.display_code} 已在列表中。"
+        )
+        self._update_watchlist_count()
+
+    @Slot()
+    def _remove_selected_stock_items(self) -> None:
+        selected = self.stock_list.selectedItems()
+        if not selected:
+            self.error_label.setText("请先在列表中点选要删除的行。")
+            return
+        for item in selected:
+            self.stock_list.takeItem(self.stock_list.row(item))
+        self.error_label.clear()
+        self.import_status_label.setText(f"已删除 {len(selected)} 项，点击保存后生效。")
+        self._update_watchlist_count()
+
+    def _update_watchlist_count(self, _item: QListWidgetItem | None = None) -> None:
+        selected_count = len(self._checked_watchlist_codes())
+        self.watchlist_count_label.setText(f"已勾选 {selected_count}/20")
+        self.add_stock_button.setEnabled(selected_count < 20)
+
+    @Slot()
+    def _import_futu_watchlist(self) -> None:
+        if self.provider is None:
+            return
+        current = self._checked_watchlist_codes()
+        dialog = FutuWatchlistImportDialog(
+            self.provider,
+            current,
+            theme=self.theme,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.selected_codes:
+            return
+        imported_count = 0
+        for code in dialog.selected_codes:
+            if self._append_watchlist_item(code):
+                imported_count += 1
+        self.error_label.clear()
+        self.import_status_label.setText(
+            f"已从富途合并 {imported_count} 只，点击保存后生效。"
+        )
+        self._update_watchlist_count()
+
     @Slot()
     def _validate_and_accept(self) -> None:
-        values = self.stock_ids.toPlainText().splitlines()
+        values = self._checked_watchlist_codes()
         try:
             watchlist = normalize_watchlist(values)
         except SymbolError as exc:
@@ -1966,6 +2389,7 @@ class QuotePanel(QWidget):
             self.alert_threshold,
             self.interval_seconds,
             self.alerts_enabled,
+            provider=self.provider,
             theme=self.current_theme,
             parent=self,
         )
