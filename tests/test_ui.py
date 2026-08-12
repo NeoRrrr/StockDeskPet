@@ -385,6 +385,73 @@ class QuotePanelTests(unittest.TestCase):
             pet.panel.close()
             pet.close()
 
+    def test_alert_only_repeats_after_rearm_and_persists_for_quote_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)
+            settings.setValue("market_defaults_v1_added", True)
+            settings.setValue("a_share_etf_defaults_v1_added", True)
+            settings.setValue("watchlist", ["159516"])
+            settings.setValue("favorites", [])
+            settings.setValue("alert_threshold", 3.0)
+            settings.setValue("alerts_enabled", True)
+
+            def quote(percent: float, quote_time: str = "2026-08-12 10:00:00") -> Quote:
+                return Quote(
+                    symbol=normalize_symbol("159516"),
+                    name="半导体设备ETF",
+                    price=1.0,
+                    previous_close=1.0,
+                    open_price=1.0,
+                    high=1.0,
+                    low=1.0,
+                    change=percent / 100.0,
+                    change_percent=percent,
+                    volume=1.0,
+                    volume_unit="手",
+                    amount=1.0,
+                    quote_time=quote_time,
+                    source="测试行情",
+                )
+
+            pet = StockPetWidget(settings)
+            pet._animation.stop()
+            pet._watch_timer.stop()
+            pet._favorite_refresh_timer.stop()
+            notifications: list[str] = []
+            pet.alert_requested.connect(lambda _title, message: notifications.append(message))
+
+            pet._on_watchlist_result(([quote(3.10)], []))
+            pet._on_watchlist_result(([quote(3.25)], []))
+            pet._on_watchlist_result(([quote(2.90)], []))
+            pet._on_watchlist_result(([quote(3.20)], []))
+            self.assertEqual(len(notifications), 1)
+
+            pet._on_watchlist_result(([quote(2.70)], []))
+            pet._on_watchlist_result(([quote(3.15)], []))
+            self.assertEqual(len(notifications), 2)
+            pet.close_provider()
+            pet.panel.close()
+            pet.close()
+
+            restarted = StockPetWidget(settings)
+            restarted._animation.stop()
+            restarted._watch_timer.stop()
+            restarted._favorite_refresh_timer.stop()
+            restarted_notifications: list[str] = []
+            restarted.alert_requested.connect(
+                lambda _title, message: restarted_notifications.append(message)
+            )
+            restarted._on_watchlist_result(([quote(3.30)], []))
+            self.assertEqual(restarted_notifications, [])
+
+            restarted._on_watchlist_result(
+                ([quote(3.30, "2026-08-13 10:00:00")], [])
+            )
+            self.assertEqual(len(restarted_notifications), 1)
+            restarted.close_provider()
+            restarted.panel.close()
+            restarted.close()
+
     def test_codexpet_skin_uses_distinct_interaction_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = QSettings(os.path.join(temp_dir, "settings.ini"), QSettings.Format.IniFormat)

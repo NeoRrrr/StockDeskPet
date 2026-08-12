@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 from datetime import datetime, timedelta, timezone
@@ -87,6 +88,8 @@ FAVORITE_REFRESH_INTERVAL_MS = 5_000
 OPEN_TAB_REFRESH_INTERVAL_MS = 10_000
 FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
 FAVORITE_BUBBLE_PAGE_SIZE = 5
+ALERT_REARM_MARGIN_PERCENT = 0.2
+ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
 HK_MARKETS = {"hk", "hk_index"}
@@ -2191,7 +2194,11 @@ class StockPetWidget(QWidget):
         self._watch_animate = False
         self._pending_page_symbols: list[str] | None = None
         self._page_refresh_initialized_keys: set[str] = set()
-        self._alert_states: dict[str, int] = {}
+        (
+            self._alert_states,
+            self._alert_last_percent,
+            self._alert_quote_dates,
+        ) = self._load_alert_cache()
         self._watch_timer = QTimer(self)
         self._watch_timer.timeout.connect(self.scan_watchlist)
         self._configure_watch_timer()
@@ -2645,12 +2652,31 @@ class StockPetWidget(QWidget):
         self.alert_threshold = threshold
         self.interval_seconds = interval_seconds
         self.alerts_enabled = alerts_enabled
-        self._alert_states.clear()
         active_keys = {
+            normalize_symbol(code).provider_symbol
+            for code in self.watchlist
+        }
+        self._alert_states = {
+            key: direction
+            for key, direction in self._alert_states.items()
+            if key in active_keys
+        }
+        self._alert_last_percent = {
+            key: percent
+            for key, percent in self._alert_last_percent.items()
+            if key in active_keys
+        }
+        self._alert_quote_dates = {
+            key: quote_date
+            for key, quote_date in self._alert_quote_dates.items()
+            if key in active_keys
+        }
+        self._save_alert_cache()
+        refresh_keys = {
             normalize_symbol(code).provider_symbol
             for code in [*self.watchlist, *INDEX_SYMBOLS]
         }
-        self._page_refresh_initialized_keys.intersection_update(active_keys)
+        self._page_refresh_initialized_keys.intersection_update(refresh_keys)
         self._configure_watch_timer()
         if alerts_enabled and watchlist:
             self.scan_watchlist()
@@ -2764,19 +2790,102 @@ class StockPetWidget(QWidget):
 
         for quote in stock_quotes:
             symbol_key = quote.symbol.provider_symbol
-            if abs(quote.change_percent) < self.alert_threshold:
-                self._alert_states.pop(symbol_key, None)
-                continue
-            direction = 1 if quote.change_percent > 0 else -1
-            if self._alert_states.get(symbol_key) == direction:
-                continue
+            self._process_alert_quote(symbol_key, quote)
+        self._save_alert_cache()
+
+    def _process_alert_quote(self, symbol_key: str, quote: Quote) -> None:
+        quote_date = quote.quote_time.strip().split(" ", 1)[0]
+        if len(quote_date) != 10 or quote_date[4:5] != "-" or quote_date[7:8] != "-":
+            quote_date = datetime.now(MARKET_TIMEZONE).date().isoformat()
+
+        if self._alert_quote_dates.get(symbol_key) != quote_date:
+            self._alert_states.pop(symbol_key, None)
+            self._alert_last_percent.pop(symbol_key, None)
+
+        percent = quote.change_percent
+        previous = self._alert_last_percent.get(symbol_key)
+        active_direction = self._alert_states.get(symbol_key)
+        rearm_threshold = max(0.0, self.alert_threshold - ALERT_REARM_MARGIN_PERCENT)
+
+        if active_direction == 1 and percent <= rearm_threshold:
+            self._alert_states.pop(symbol_key, None)
+            active_direction = None
+        elif active_direction == -1 and percent >= -rearm_threshold:
+            self._alert_states.pop(symbol_key, None)
+            active_direction = None
+
+        direction = (
+            1
+            if percent >= self.alert_threshold
+            else -1
+            if percent <= -self.alert_threshold
+            else 0
+        )
+        crossed_threshold = (
+            previous is None
+            or (direction == 1 and previous < self.alert_threshold)
+            or (direction == -1 and previous > -self.alert_threshold)
+        )
+        if direction and active_direction != direction and crossed_threshold:
             self._alert_states[symbol_key] = direction
             action = "上涨" if direction > 0 else "下跌"
             self.alert_requested.emit(
                 "股票桌宠提醒",
-                f"{quote.name} {quote.symbol.display_code} {action} {abs(quote.change_percent):.2f}%\n"
-                f"达到提醒阈值 ±{self.alert_threshold:.1f}% · {quote.quote_time}",
+                f"{quote.name} {quote.symbol.display_code} {action} {abs(percent):.2f}%\n"
+                f"首次突破提醒阈值 ±{self.alert_threshold:.1f}% · {quote.quote_time}",
             )
+
+        self._alert_last_percent[symbol_key] = percent
+        self._alert_quote_dates[symbol_key] = quote_date
+
+    def _load_alert_cache(self) -> tuple[dict[str, int], dict[str, float], dict[str, str]]:
+        raw = str(self.settings.value(ALERT_CACHE_SETTINGS_KEY, "") or "")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            payload = {}
+
+        states: dict[str, int] = {}
+        percents: dict[str, float] = {}
+        quote_dates: dict[str, str] = {}
+        if not isinstance(payload, dict):
+            return states, percents, quote_dates
+
+        for key, snapshot in payload.items():
+            if not isinstance(key, str) or not isinstance(snapshot, dict):
+                continue
+            try:
+                percent = float(snapshot.get("percent"))
+                direction = int(snapshot.get("direction", 0))
+            except (TypeError, ValueError):
+                continue
+            quote_date = str(snapshot.get("quote_date", ""))
+            if not math.isfinite(percent) or direction not in {-1, 0, 1}:
+                continue
+            percents[key] = percent
+            quote_dates[key] = quote_date
+            if direction:
+                states[key] = direction
+        return states, percents, quote_dates
+
+    def _save_alert_cache(self) -> None:
+        active_keys = {
+            normalize_symbol(code).provider_symbol for code in self.watchlist
+        }
+        payload = {
+            key: {
+                "percent": self._alert_last_percent[key],
+                "direction": self._alert_states.get(key, 0),
+                "quote_date": self._alert_quote_dates.get(key, ""),
+            }
+            for key in active_keys
+            if key in self._alert_last_percent
+        }
+        self.settings.setValue(
+            ALERT_CACHE_SETTINGS_KEY,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        self.settings.sync()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton:
