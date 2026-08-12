@@ -48,7 +48,7 @@ class QuotePanelTests(unittest.TestCase):
         self.assertFalse(QIcon(str(asset_path("app_icon.ico"))).isNull())
 
     def test_futu_import_dialog_respects_existing_items_and_remaining_slots(self) -> None:
-        existing = [f"0000{index:02d}" for index in range(1, 20)]
+        existing = [f"0000{index:02d}" for index in range(1, 100)]
         with patch("stock_pet.ui.QThreadPool.globalInstance"):
             dialog = FutuWatchlistImportDialog(
                 TencentQuoteProvider(),  # type: ignore[arg-type]
@@ -99,21 +99,34 @@ class QuotePanelTests(unittest.TestCase):
             self.assertIn("已从富途合并 2 只", dialog.import_status_label.text())
             dialog.close()
 
-    def test_watchlist_dialog_supports_checkbox_plus_and_minus_editing(self) -> None:
+    def test_watchlist_dialog_supports_checkbox_visibility_and_deletion(self) -> None:
         dialog = WatchlistDialog(["00700", "159516"], 3.0, 60, True)
         self.assertEqual(dialog.stock_list.count(), 2)
         self.assertEqual(dialog._checked_watchlist_codes(), ["00700", "159516"])
 
         dialog.stock_list.item(1).setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(dialog._checked_watchlist_codes(), ["00700"])
-        dialog.stock_add_input.setText("01810")
-        dialog._add_stock_item()
-        self.assertEqual(dialog._checked_watchlist_codes(), ["00700", "01810"])
 
         dialog.stock_list.setCurrentItem(dialog.stock_list.item(0))
         dialog._remove_selected_stock_items()
-        self.assertEqual(dialog._checked_watchlist_codes(), ["01810"])
-        self.assertEqual(dialog.watchlist_count_label.text(), "已勾选 1/20")
+        self.assertEqual(dialog._checked_watchlist_codes(), [])
+        self.assertEqual(dialog.watchlist_count_label.text(), "显示 0 · 自选库 1/100")
+        self.assertFalse(hasattr(dialog, "stock_add_input"))
+        dialog.close()
+
+    def test_unchecked_watchlist_items_remain_in_catalog_after_save(self) -> None:
+        dialog = WatchlistDialog(
+            ["00700", "159516"],
+            3.0,
+            60,
+            True,
+            checked_watchlist=["00700"],
+        )
+        self.assertEqual(dialog._checked_watchlist_codes(), ["00700"])
+        self.assertEqual(dialog._all_watchlist_codes(), ["00700", "159516"])
+        dialog._validate_and_accept()
+        self.assertEqual(dialog.saved_config[0], ["00700"])
+        self.assertEqual(dialog.saved_config[4], ["00700", "159516"])
         dialog.close()
 
     def test_current_tab_refresh_emits_only_visible_market(self) -> None:

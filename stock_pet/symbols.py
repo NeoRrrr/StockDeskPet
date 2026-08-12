@@ -9,6 +9,9 @@ class SymbolError(ValueError):
     pass
 
 
+MAX_WATCHLIST_ITEMS = 100
+
+
 _PREFIXED_RE = re.compile(r"^(HK|SH|SZ|BJ)(\d{1,6})$", re.IGNORECASE)
 _SUFFIXED_RE = re.compile(r"^(\d{1,6})\.(HK|SS|SH|SZ|BJ)$", re.IGNORECASE)
 
@@ -74,7 +77,10 @@ def normalize_symbol(raw: str) -> StockSymbol:
     return _make_symbol(raw, market, value)
 
 
-def normalize_watchlist(values: list[str], max_items: int = 20) -> list[str]:
+def normalize_watchlist(
+    values: list[str],
+    max_items: int = MAX_WATCHLIST_ITEMS,
+) -> list[str]:
     """Normalize, de-duplicate and validate user-saved stock IDs."""
     normalized: list[str] = []
     seen: set[str] = set()

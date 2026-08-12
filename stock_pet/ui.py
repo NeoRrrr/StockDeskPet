@@ -40,7 +40,13 @@ from .hybrid_quote_provider import HybridQuoteProvider
 from .models import Quote, StockSearchResult
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
-from .symbols import SymbolError, normalize_symbol, normalize_watchlist, partition_watchlist
+from .symbols import (
+    MAX_WATCHLIST_ITEMS,
+    SymbolError,
+    normalize_symbol,
+    normalize_watchlist,
+    partition_watchlist,
+)
 from .update_checker import (
     PROJECT_URL,
     AutomaticUpdateResult,
@@ -553,7 +559,7 @@ class ThemeSwitch(QAbstractButton):
 
 
 class FutuWatchlistImportDialog(QDialog):
-    MAX_WATCHLIST_ITEMS = 20
+    MAX_WATCHLIST_ITEMS = MAX_WATCHLIST_ITEMS
 
     def __init__(
         self,
@@ -809,6 +815,7 @@ class WatchlistDialog(QDialog):
         interval_seconds: int,
         alerts_enabled: bool,
         provider: HybridQuoteProvider | None = None,
+        checked_watchlist: list[str] | None = None,
         theme: str = "dark",
         parent: QWidget | None = None,
     ) -> None:
@@ -816,7 +823,7 @@ class WatchlistDialog(QDialog):
         _load_ui_fonts()
         self.provider = provider
         self.theme = theme
-        self.saved_config: tuple[list[str], float, int, bool] | None = None
+        self.saved_config: tuple[list[str], float, int, bool, list[str]] | None = None
         self.setWindowTitle("自选与提醒设置")
         self.setModal(True)
         self.setMinimumSize(430, 420)
@@ -828,8 +835,7 @@ class WatchlistDialog(QDialog):
         title = QLabel("自选与提醒设置")
         title.setObjectName("dialogTitle")
         help_label = QLabel(
-            "滑动查看并勾选要保留的股票，最多 20 只。"
-            "支持港股、沪市、深市和北交所。"
+            "勾选要在桌宠中显示的股票；新增股票请回主界面搜索并保存。"
         )
         help_label.setWordWrap(True)
         help_label.setObjectName("dialogHelp")
@@ -840,30 +846,28 @@ class WatchlistDialog(QDialog):
         self.stock_list.setObjectName("watchlistEditor")
         self.stock_list.setMinimumHeight(180)
         self.stock_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        checked_keys = {
+            normalize_symbol(code).provider_symbol
+            for code in normalize_watchlist(
+                checked_watchlist if checked_watchlist is not None else watchlist
+            )
+        }
         for code in normalize_watchlist(watchlist):
-            self._append_watchlist_item(code)
+            self._append_watchlist_item(
+                code,
+                checked=normalize_symbol(code).provider_symbol in checked_keys,
+            )
         layout.addWidget(self.stock_list)
 
         edit_row = QHBoxLayout()
-        self.stock_add_input = QLineEdit()
-        self.stock_add_input.setObjectName("watchlistAddInput")
-        self.stock_add_input.setPlaceholderText("输入股票代码，如 00700 / 600519")
-        self.stock_add_input.returnPressed.connect(self._add_stock_item)
-        self.add_stock_button = QPushButton("+")
-        self.add_stock_button.setObjectName("watchlistAddButton")
-        self.add_stock_button.setFixedWidth(42)
-        self.add_stock_button.setToolTip("添加股票")
-        self.add_stock_button.clicked.connect(self._add_stock_item)
-        self.remove_stock_button = QPushButton("−")
+        self.remove_stock_button = QPushButton("删除选中")
         self.remove_stock_button.setObjectName("watchlistRemoveButton")
-        self.remove_stock_button.setFixedWidth(42)
-        self.remove_stock_button.setToolTip("删除当前选中的行")
+        self.remove_stock_button.setToolTip("删除列表中当前选中的行")
         self.remove_stock_button.clicked.connect(self._remove_selected_stock_items)
         self.watchlist_count_label = QLabel("")
         self.watchlist_count_label.setObjectName("dialogHelp")
-        edit_row.addWidget(self.stock_add_input, 1)
-        edit_row.addWidget(self.add_stock_button)
         edit_row.addWidget(self.remove_stock_button)
+        edit_row.addStretch()
         edit_row.addWidget(self.watchlist_count_label)
         layout.addLayout(edit_row)
         self.stock_list.itemChanged.connect(self._update_watchlist_count)
@@ -965,7 +969,7 @@ class WatchlistDialog(QDialog):
             QLabel#dialogHelp { color: #8797aa; font-size: 12px; }
             QLabel#dialogError { color: #f05a5f; font-size: 12px; }
             QLabel#sliderValue { color: #aebed1; font: 600 12px "Noto Sans SC"; }
-            QListWidget#watchlistEditor, QLineEdit#watchlistAddInput {
+            QListWidget#watchlistEditor {
                 color: #e6edf6; background: #111e2c; border: 1px solid #324257;
                 border-radius: 8px; padding: 7px; font: 13px "Noto Sans SC";
             }
@@ -996,7 +1000,7 @@ class WatchlistDialog(QDialog):
             QLabel#dialogTitle { color: #17253a; }
             QLabel#dialogHelp { color: #68778c; }
             QLabel#sliderValue { color: #40516a; }
-            QListWidget#watchlistEditor, QLineEdit#watchlistAddInput {
+            QListWidget#watchlistEditor {
                 color: #1f2d42; background: #ffffff; border-color: #c6d2e1;
             }
             QListWidget#watchlistEditor::item:selected { color: #ffffff; background: #2d6ed8; }
@@ -1028,6 +1032,12 @@ class WatchlistDialog(QDialog):
             if (item := self.stock_list.item(index)).checkState() == Qt.CheckState.Checked
         ]
 
+    def _all_watchlist_codes(self) -> list[str]:
+        return [
+            str(self.stock_list.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.stock_list.count())
+        ]
+
     def _find_watchlist_item(self, provider_symbol: str) -> QListWidgetItem | None:
         for index in range(self.stock_list.count()):
             item = self.stock_list.item(index)
@@ -1049,12 +1059,10 @@ class WatchlistDialog(QDialog):
         existing = self._find_watchlist_item(symbol.provider_symbol)
         if existing is not None:
             if checked and existing.checkState() != Qt.CheckState.Checked:
-                if len(self._checked_watchlist_codes()) >= 20:
-                    return False
                 existing.setCheckState(Qt.CheckState.Checked)
             self.stock_list.setCurrentItem(existing)
             return False
-        if checked and len(self._checked_watchlist_codes()) >= 20:
+        if self.stock_list.count() >= MAX_WATCHLIST_ITEMS:
             return False
         item = QListWidgetItem(f"{symbol.display_code}  ·  {symbol.market_label}")
         item.setData(Qt.ItemDataRole.UserRole, symbol.code)
@@ -1062,29 +1070,6 @@ class WatchlistDialog(QDialog):
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.stock_list.addItem(item)
         return True
-
-    @Slot()
-    def _add_stock_item(self) -> None:
-        raw_symbol = self.stock_add_input.text().strip()
-        if not raw_symbol:
-            self.error_label.setText("请先输入股票代码。")
-            return
-        try:
-            symbol = normalize_symbol(raw_symbol)
-            existing = self._find_watchlist_item(symbol.provider_symbol)
-            added = self._append_watchlist_item(raw_symbol)
-        except SymbolError as exc:
-            self.error_label.setText(str(exc))
-            return
-        if not added and existing is None and len(self._checked_watchlist_codes()) >= 20:
-            self.error_label.setText("自选股最多保存 20 只，请先取消勾选或删除一项。")
-            return
-        self.stock_add_input.clear()
-        self.error_label.clear()
-        self.import_status_label.setText(
-            f"已添加 {symbol.display_code}。" if added else f"{symbol.display_code} 已在列表中。"
-        )
-        self._update_watchlist_count()
 
     @Slot()
     def _remove_selected_stock_items(self) -> None:
@@ -1100,14 +1085,15 @@ class WatchlistDialog(QDialog):
 
     def _update_watchlist_count(self, _item: QListWidgetItem | None = None) -> None:
         selected_count = len(self._checked_watchlist_codes())
-        self.watchlist_count_label.setText(f"已勾选 {selected_count}/20")
-        self.add_stock_button.setEnabled(selected_count < 20)
+        self.watchlist_count_label.setText(
+            f"显示 {selected_count} · 自选库 {self.stock_list.count()}/{MAX_WATCHLIST_ITEMS}"
+        )
 
     @Slot()
     def _import_futu_watchlist(self) -> None:
         if self.provider is None:
             return
-        current = self._checked_watchlist_codes()
+        current = self._all_watchlist_codes()
         dialog = FutuWatchlistImportDialog(
             self.provider,
             current,
@@ -1129,6 +1115,7 @@ class WatchlistDialog(QDialog):
     @Slot()
     def _validate_and_accept(self) -> None:
         values = self._checked_watchlist_codes()
+        catalog = normalize_watchlist(self._all_watchlist_codes())
         try:
             watchlist = normalize_watchlist(values)
         except SymbolError as exc:
@@ -1139,6 +1126,7 @@ class WatchlistDialog(QDialog):
             self.threshold.value() / 10.0,
             self.INTERVAL_OPTIONS[self.interval.value()],
             bool(self.alerts_enabled.isChecked()),
+            catalog,
         )
         self.accept()
 
@@ -1467,7 +1455,15 @@ class QuotePanel(QWidget):
             self.watchlist = normalize_watchlist(saved_watchlist)
         except SymbolError:
             self.watchlist = list(DEFAULT_WATCHLIST)
+        saved_catalog = _settings_list(settings, "watchlist_catalog")
+        try:
+            self.watchlist_catalog = normalize_watchlist(
+                [*(saved_catalog or self.watchlist), *self.watchlist]
+            )
+        except SymbolError:
+            self.watchlist_catalog = list(self.watchlist)
         settings.setValue("watchlist", self.watchlist)
+        settings.setValue("watchlist_catalog", self.watchlist_catalog)
         settings.sync()
         self.alert_threshold = float(settings.value("alert_threshold", 3.0))
         self.interval_seconds = int(settings.value("alert_interval_seconds", 60))
@@ -2368,6 +2364,7 @@ class QuotePanel(QWidget):
         try:
             symbol = normalize_symbol(raw_symbol)
             watchlist = normalize_watchlist([*self.watchlist, symbol.code])
+            catalog = normalize_watchlist([*self.watchlist_catalog, symbol.code])
         except SymbolError as exc:
             self.status_label.setText(str(exc))
             return
@@ -2379,17 +2376,19 @@ class QuotePanel(QWidget):
             self.alert_threshold,
             self.interval_seconds,
             self.alerts_enabled,
+            catalog,
         )
         self.status_label.setText(f"已保存股票 ID：{symbol.code}")
 
     @Slot()
     def manage_watchlist(self) -> None:
         dialog = WatchlistDialog(
-            self.watchlist,
+            self.watchlist_catalog,
             self.alert_threshold,
             self.interval_seconds,
             self.alerts_enabled,
             provider=self.provider,
+            checked_watchlist=self.watchlist,
             theme=self.current_theme,
             parent=self,
         )
@@ -2413,12 +2412,15 @@ class QuotePanel(QWidget):
         threshold: float,
         interval_seconds: int,
         alerts_enabled: bool,
+        catalog: list[str] | None = None,
     ) -> None:
         self.watchlist = watchlist
+        self.watchlist_catalog = normalize_watchlist(catalog or watchlist)
         self.alert_threshold = threshold
         self.interval_seconds = interval_seconds
         self.alerts_enabled = alerts_enabled
         self.settings.setValue("watchlist", watchlist)
+        self.settings.setValue("watchlist_catalog", self.watchlist_catalog)
         self.settings.setValue("alert_threshold", threshold)
         self.settings.setValue("alert_interval_seconds", interval_seconds)
         self.settings.setValue("alerts_enabled", alerts_enabled)

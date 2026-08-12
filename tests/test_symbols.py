@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from stock_pet.symbols import (
+    MAX_WATCHLIST_ITEMS,
     SymbolError,
     normalize_symbol,
     normalize_watchlist,
@@ -45,6 +46,7 @@ class NormalizeSymbolTests(unittest.TestCase):
     def test_watchlist_limit(self) -> None:
         with self.assertRaises(SymbolError):
             normalize_watchlist(["00700", "00941"], max_items=1)
+        self.assertEqual(MAX_WATCHLIST_ITEMS, 100)
 
     def test_watchlist_is_partitioned_by_market(self) -> None:
         self.assertEqual(
