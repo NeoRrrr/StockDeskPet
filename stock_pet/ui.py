@@ -90,6 +90,7 @@ FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
 FAVORITE_BUBBLE_PAGE_SIZE = 5
 ALERT_REARM_MARGIN_PERCENT = 0.2
 ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
+MARKET_CLOSE_REFRESH_GRACE_MINUTES = 10
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
 HK_MARKETS = {"hk", "hk_index"}
@@ -128,7 +129,14 @@ def _is_open_for_automatic_refresh(
     )
     if not sessions:
         return True
-    return any(start <= minute < end for start, end in sessions)
+    return any(
+        start <= minute < (
+            end + MARKET_CLOSE_REFRESH_GRACE_MINUTES
+            if index == len(sessions) - 1
+            else end
+        )
+        for index, (start, end) in enumerate(sessions)
+    )
 
 
 def _automatic_refresh_symbols(

@@ -31,6 +31,7 @@ from stock_pet.ui import (
     QuotePanel,
     StockPetWidget,
     ThemeSwitch,
+    _is_open_for_automatic_refresh,
     _is_visible_in_idle_bubble,
 )
 
@@ -321,6 +322,34 @@ class QuotePanelTests(unittest.TestCase):
         self.assertFalse(
             _is_visible_in_idle_bubble(
                 "01810", datetime(*thursday, 16, 0, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+
+    def test_automatic_refresh_continues_for_ten_minutes_after_close(self) -> None:
+        thursday = (2026, 8, 6)
+        self.assertTrue(
+            _is_open_for_automatic_refresh(
+                "159516", datetime(*thursday, 15, 9, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertFalse(
+            _is_open_for_automatic_refresh(
+                "159516", datetime(*thursday, 15, 10, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertTrue(
+            _is_open_for_automatic_refresh(
+                "01810", datetime(*thursday, 16, 9, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertFalse(
+            _is_open_for_automatic_refresh(
+                "01810", datetime(*thursday, 16, 10, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertFalse(
+            _is_open_for_automatic_refresh(
+                "159516", datetime(*thursday, 11, 40, tzinfo=MARKET_TIMEZONE)
             )
         )
 
