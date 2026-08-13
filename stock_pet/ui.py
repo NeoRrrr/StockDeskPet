@@ -91,8 +91,11 @@ TAB_MARKET_SUMMARIES: dict[int, tuple[tuple[str, str], ...]] = {
 }
 FAVORITE_REFRESH_INTERVAL_MS = 5_000
 OPEN_TAB_REFRESH_INTERVAL_MS = 10_000
-FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 2_000
+FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 10_000
 FAVORITE_BUBBLE_PAGE_SIZE = 5
+FAVORITE_BUBBLE_MAX_PAGE_SIZE = 10
+FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY = "favorite_bubble_page_size"
+FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY = "favorite_bubble_page_interval_seconds"
 ALERT_REARM_MARGIN_PERCENT = 0.2
 ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
 STOCK_NAME_CACHE_SETTINGS_KEY = "stock_name_cache_v1"
@@ -1244,6 +1247,8 @@ class WatchlistDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
+    bubble_settings_changed = Signal(int, int)
+
     def __init__(
         self,
         settings: QSettings,
@@ -1260,7 +1265,7 @@ class SettingsDialog(QDialog):
         self._release_url = f"{PROJECT_URL}/releases"
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setFixedSize(430, 478)
+        self.setFixedSize(430, 612)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -1268,7 +1273,7 @@ class SettingsDialog(QDialog):
 
         title = QLabel("设置")
         title.setObjectName("settingsTitle")
-        subtitle = QLabel("行情源、应用信息与版本更新")
+        subtitle = QLabel("行情源、待机气泡、应用信息与版本更新")
         subtitle.setObjectName("settingsSubtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -1303,6 +1308,87 @@ class SettingsDialog(QDialog):
         source_layout.addWidget(self.provider_status)
         self.quote_source_combo.currentIndexChanged.connect(self._on_quote_source_changed)
         layout.addWidget(source_card)
+
+        bubble_card = QFrame()
+        bubble_card.setObjectName("bubbleCard")
+        bubble_layout = QVBoxLayout(bubble_card)
+        bubble_layout.setContentsMargins(16, 13, 16, 13)
+        bubble_layout.setSpacing(9)
+        bubble_title = QLabel("待机气泡")
+        bubble_title.setObjectName("cardTitle")
+        bubble_help = QLabel("设置收藏行情每页显示数量和自动切换时间；0 条表示关闭气泡")
+        bubble_help.setObjectName("bubbleHelp")
+        bubble_layout.addWidget(bubble_title)
+        bubble_layout.addWidget(bubble_help)
+
+        saved_page_size = max(
+            0,
+            min(
+                FAVORITE_BUBBLE_MAX_PAGE_SIZE,
+                int(
+                    settings.value(
+                        FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_PAGE_SIZE,
+                    )
+                ),
+            ),
+        )
+        saved_interval_seconds = max(
+            1,
+            min(
+                30,
+                int(
+                    settings.value(
+                        FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_PAGE_INTERVAL_MS // 1_000,
+                    )
+                ),
+            ),
+        )
+
+        page_size_row = QHBoxLayout()
+        page_size_label = QLabel("每页数量")
+        self.bubble_page_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bubble_page_size_slider.setObjectName("bubblePageSizeSlider")
+        self.bubble_page_size_slider.setRange(0, FAVORITE_BUBBLE_MAX_PAGE_SIZE)
+        self.bubble_page_size_slider.setValue(saved_page_size)
+        self.bubble_page_size_value = QLabel(f"{saved_page_size} 条")
+        self.bubble_page_size_value.setObjectName("bubbleSettingValue")
+        self.bubble_page_size_value.setFixedWidth(42)
+        self.bubble_page_size_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        page_size_row.addWidget(page_size_label)
+        page_size_row.addWidget(self.bubble_page_size_slider, 1)
+        page_size_row.addWidget(self.bubble_page_size_value)
+        bubble_layout.addLayout(page_size_row)
+
+        interval_row = QHBoxLayout()
+        interval_label = QLabel("切换时间")
+        self.bubble_interval_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bubble_interval_slider.setObjectName("bubbleIntervalSlider")
+        self.bubble_interval_slider.setRange(1, 30)
+        self.bubble_interval_slider.setValue(saved_interval_seconds)
+        self.bubble_interval_value = QLabel(f"{saved_interval_seconds} 秒")
+        self.bubble_interval_value.setObjectName("bubbleSettingValue")
+        self.bubble_interval_value.setFixedWidth(42)
+        self.bubble_interval_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        interval_row.addWidget(interval_label)
+        interval_row.addWidget(self.bubble_interval_slider, 1)
+        interval_row.addWidget(self.bubble_interval_value)
+        bubble_layout.addLayout(interval_row)
+
+        settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, saved_page_size)
+        settings.setValue(
+            FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+            saved_interval_seconds,
+        )
+        settings.sync()
+        self.bubble_page_size_slider.valueChanged.connect(self._on_bubble_settings_changed)
+        self.bubble_interval_slider.valueChanged.connect(self._on_bubble_settings_changed)
+        layout.addWidget(bubble_card)
 
         version_card = QFrame()
         version_card.setObjectName("versionCard")
@@ -1364,12 +1450,25 @@ class SettingsDialog(QDialog):
             QLabel { color: #c8d2df; font-family: "Noto Sans SC"; }
             QLabel#settingsTitle { color: #eef4fb; font: 600 20px "Microsoft YaHei UI"; }
             QLabel#settingsSubtitle { color: #7f90a5; font-size: 12px; }
-            QFrame#sourceCard, QFrame#versionCard {
+            QFrame#sourceCard, QFrame#bubbleCard, QFrame#versionCard {
                 background: #101b28; border: 1px solid #32445b; border-radius: 10px;
             }
             QLabel#cardTitle, QLabel#appName { color: #e8eff8; font: 600 14px "Noto Sans SC"; }
             QLabel#versionValue { color: #91a5bd; font-size: 12px; }
-            QLabel#providerStatus, QLabel#updateStatus { color: #91a5bd; font-size: 12px; }
+            QLabel#providerStatus, QLabel#updateStatus, QLabel#bubbleHelp, QLabel#bubbleSettingValue {
+                color: #91a5bd; font-size: 12px;
+            }
+            QSlider#bubblePageSizeSlider::groove:horizontal,
+            QSlider#bubbleIntervalSlider::groove:horizontal {
+                height: 4px; background: #26384d; border-radius: 2px;
+            }
+            QSlider#bubblePageSizeSlider::sub-page:horizontal,
+            QSlider#bubbleIntervalSlider::sub-page:horizontal { background: #397bec; border-radius: 2px; }
+            QSlider#bubblePageSizeSlider::handle:horizontal,
+            QSlider#bubbleIntervalSlider::handle:horizontal {
+                width: 14px; margin: -5px 0; background: #ffffff;
+                border: 1px solid #397bec; border-radius: 7px;
+            }
             QComboBox#quoteSourceCombo {
                 color: #e4edf7; background: #0c1622; border: 1px solid #32445b;
                 border-radius: 8px; padding: 7px 10px; min-height: 18px;
@@ -1403,9 +1502,20 @@ class SettingsDialog(QDialog):
                 QDialog { background: #f6f8fb; }
                 QLabel { color: #243247; }
                 QLabel#settingsTitle { color: #17253a; }
-                QLabel#settingsSubtitle, QLabel#providerStatus, QLabel#versionValue, QLabel#updateStatus { color: #68778c; }
-                QFrame#sourceCard, QFrame#versionCard { background: #ffffff; border-color: #c6d2e1; }
+                QLabel#settingsSubtitle, QLabel#providerStatus, QLabel#versionValue,
+                QLabel#updateStatus, QLabel#bubbleHelp, QLabel#bubbleSettingValue { color: #68778c; }
+                QFrame#sourceCard, QFrame#bubbleCard, QFrame#versionCard {
+                    background: #ffffff; border-color: #c6d2e1;
+                }
                 QLabel#cardTitle, QLabel#appName { color: #1f2d42; }
+                QSlider#bubblePageSizeSlider::groove:horizontal,
+                QSlider#bubbleIntervalSlider::groove:horizontal { background: #d3dde9; }
+                QSlider#bubblePageSizeSlider::sub-page:horizontal,
+                QSlider#bubbleIntervalSlider::sub-page:horizontal { background: #2d6ed8; }
+                QSlider#bubblePageSizeSlider::handle:horizontal,
+                QSlider#bubbleIntervalSlider::handle:horizontal {
+                    background: #ffffff; border-color: #2d6ed8;
+                }
                 QComboBox#quoteSourceCombo {
                     color: #243247; background: #ffffff; border-color: #c6d2e1;
                 }
@@ -1426,6 +1536,20 @@ class SettingsDialog(QDialog):
                 }
             """
         self.setStyleSheet(stylesheet)
+
+    @Slot(int)
+    def _on_bubble_settings_changed(self, _value: int) -> None:
+        page_size = self.bubble_page_size_slider.value()
+        interval_seconds = self.bubble_interval_slider.value()
+        self.bubble_page_size_value.setText(f"{page_size} 条")
+        self.bubble_interval_value.setText(f"{interval_seconds} 秒")
+        self.settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, page_size)
+        self.settings.setValue(
+            FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+            interval_seconds,
+        )
+        self.settings.sync()
+        self.bubble_settings_changed.emit(page_size, interval_seconds)
 
     @Slot(int)
     def _on_quote_source_changed(self, _index: int) -> None:
@@ -1539,6 +1663,7 @@ class QuotePanel(QWidget):
     page_refresh_requested = Signal(object)
     periodic_page_refresh_requested = Signal(object)
     theme_changed = Signal(str)
+    bubble_settings_changed = Signal(int, int)
 
     def __init__(self, provider: TencentQuoteProvider, settings: QSettings) -> None:
         super().__init__()
@@ -2544,12 +2669,19 @@ class QuotePanel(QWidget):
 
     @Slot()
     def open_settings(self) -> None:
-        SettingsDialog(
+        dialog = SettingsDialog(
             self.settings,
             self.provider,
             theme=self.current_theme,
             parent=self,
-        ).exec()
+        )
+        dialog.bubble_settings_changed.connect(
+            lambda page_size, interval_seconds: self.bubble_settings_changed.emit(
+                page_size,
+                interval_seconds,
+            )
+        )
+        dialog.exec()
 
     def _save_watchlist_config(
         self,
@@ -2777,11 +2909,45 @@ class StockPetWidget(QWidget):
         self.panel.page_refresh_requested.connect(self.refresh_market_page)
         self.panel.periodic_page_refresh_requested.connect(self.refresh_market_page_silent)
         self.panel.theme_changed.connect(self._on_bubble_theme_changed)
+        self.panel.bubble_settings_changed.connect(self._apply_bubble_settings)
         self.watchlist = list(self.panel.watchlist)
         self.favorite_symbols = list(self.panel.favorite_symbols)
         self.alert_threshold = self.panel.alert_threshold
         self.interval_seconds = self.panel.interval_seconds
         self.alerts_enabled = self.panel.alerts_enabled
+        self.favorite_bubble_page_size = max(
+            0,
+            min(
+                FAVORITE_BUBBLE_MAX_PAGE_SIZE,
+                int(
+                    self.settings.value(
+                        FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_PAGE_SIZE,
+                    )
+                ),
+            ),
+        )
+        self.favorite_bubble_page_interval_seconds = max(
+            1,
+            min(
+                30,
+                int(
+                    self.settings.value(
+                        FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_PAGE_INTERVAL_MS // 1_000,
+                    )
+                ),
+            ),
+        )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
+            self.favorite_bubble_page_size,
+        )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+            self.favorite_bubble_page_interval_seconds,
+        )
+        self.settings.sync()
         self._watch_task: WatchlistTask | None = None
         self._watch_manual = False
         self._watch_animate = False
@@ -2803,6 +2969,9 @@ class StockPetWidget(QWidget):
         self._favorite_refresh_timer = QTimer(self)
         self._favorite_refresh_timer.timeout.connect(self.refresh_favorites)
         self._favorite_carousel_timer = QTimer(self)
+        self._favorite_carousel_timer.setInterval(
+            self.favorite_bubble_page_interval_seconds * 1_000
+        )
         self._favorite_carousel_timer.timeout.connect(self._show_next_favorite)
         self._bubble_showing_favorites = False
 
@@ -2997,7 +3166,7 @@ class StockPetWidget(QWidget):
     def _show_favorite_prompt(self) -> None:
         self._bubble_showing_favorites = False
         self._bubble_direction = 0
-        if not self.favorite_symbols or not any(
+        if self.favorite_bubble_page_size <= 0 or not self.favorite_symbols or not any(
             _is_visible_in_idle_bubble(symbol) for symbol in self.favorite_symbols
         ):
             self._hide_favorite_bubble()
@@ -3036,15 +3205,23 @@ class StockPetWidget(QWidget):
         self._apply_bubble_theme(self.panel.current_theme)
 
     def _favorite_page_count(self) -> int:
+        if self.favorite_bubble_page_size <= 0:
+            return 0
         return max(
             1,
-            math.ceil(len(self._visible_favorite_quotes()) / FAVORITE_BUBBLE_PAGE_SIZE),
+            math.ceil(
+                len(self._visible_favorite_quotes()) / self.favorite_bubble_page_size
+            ),
         )
 
     def _render_favorite_page(self, page_index: int) -> None:
+        if self.favorite_bubble_page_size <= 0:
+            self._favorite_carousel_timer.stop()
+            self._hide_favorite_bubble()
+            return
         visible_quotes = self._visible_favorite_quotes()
-        start = page_index * FAVORITE_BUBBLE_PAGE_SIZE
-        quotes = visible_quotes[start : start + FAVORITE_BUBBLE_PAGE_SIZE]
+        start = page_index * self.favorite_bubble_page_size
+        quotes = visible_quotes[start : start + self.favorite_bubble_page_size]
         if not quotes:
             self._favorite_carousel_timer.stop()
             self._hide_favorite_bubble()
@@ -3080,6 +3257,11 @@ class StockPetWidget(QWidget):
 
     @Slot()
     def _show_next_favorite(self) -> None:
+        if self.favorite_bubble_page_size <= 0:
+            self._favorite_carousel_timer.stop()
+            self._favorite_index = 0
+            self._hide_favorite_bubble()
+            return
         if not self._favorite_quotes:
             self._show_favorite_prompt()
             return
@@ -3120,11 +3302,49 @@ class StockPetWidget(QWidget):
         else:
             self.refresh_favorites()
 
+    @Slot(int, int)
+    def _apply_bubble_settings(self, page_size: int, interval_seconds: int) -> None:
+        self.favorite_bubble_page_size = max(
+            0,
+            min(FAVORITE_BUBBLE_MAX_PAGE_SIZE, int(page_size)),
+        )
+        self.favorite_bubble_page_interval_seconds = max(
+            1,
+            min(30, int(interval_seconds)),
+        )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
+            self.favorite_bubble_page_size,
+        )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
+            self.favorite_bubble_page_interval_seconds,
+        )
+        self.settings.sync()
+        self._favorite_carousel_timer.stop()
+        self._favorite_carousel_timer.setInterval(
+            self.favorite_bubble_page_interval_seconds * 1_000
+        )
+        self._favorite_index = 0
+        if self.favorite_bubble_page_size <= 0:
+            self._hide_favorite_bubble()
+            return
+        if self._visible_favorite_quotes():
+            self._show_next_favorite()
+            if self._favorite_page_count() > 1:
+                self._favorite_carousel_timer.start()
+        else:
+            self._show_favorite_prompt()
+
     @Slot()
     def refresh_favorites(self) -> None:
         if not self.favorite_symbols:
             return
-        if self._favorite_quotes:
+        if self._favorite_quotes and self.favorite_bubble_page_size <= 0:
+            self._favorite_carousel_timer.stop()
+            self._favorite_index = 0
+            self._hide_favorite_bubble()
+        elif self._favorite_quotes:
             if self._visible_favorite_quotes():
                 current_page = (self._favorite_index - 1) % self._favorite_page_count()
                 self._render_favorite_page(current_page)
@@ -3175,19 +3395,26 @@ class StockPetWidget(QWidget):
                 is not None
             ]
             page_count = self._favorite_page_count()
-            self._favorite_index %= page_count
             self.panel.update_watchlist_quotes(refreshed_quotes)
-            if self._bubble_showing_favorites:
-                current_page = (self._favorite_index - 1) % page_count
-                self._render_favorite_page(current_page)
-                self._favorite_index = (current_page + 1) % page_count
-            else:
-                self._show_next_favorite()
-            if page_count > 1:
-                if not self._favorite_carousel_timer.isActive():
-                    self._favorite_carousel_timer.start(FAVORITE_BUBBLE_PAGE_INTERVAL_MS)
-            else:
+            if page_count <= 0:
+                self._favorite_index = 0
                 self._favorite_carousel_timer.stop()
+                self._hide_favorite_bubble()
+            else:
+                self._favorite_index %= page_count
+                if self._bubble_showing_favorites:
+                    current_page = (self._favorite_index - 1) % page_count
+                    self._render_favorite_page(current_page)
+                    self._favorite_index = (current_page + 1) % page_count
+                else:
+                    self._show_next_favorite()
+                if page_count > 1:
+                    if not self._favorite_carousel_timer.isActive():
+                        self._favorite_carousel_timer.start(
+                            self.favorite_bubble_page_interval_seconds * 1_000
+                        )
+                else:
+                    self._favorite_carousel_timer.stop()
         elif not self._favorite_quotes:
             self._bubble_showing_favorites = False
             self._bubble_direction = 0
@@ -3225,8 +3452,9 @@ class StockPetWidget(QWidget):
     @Slot(str)
     def _on_bubble_theme_changed(self, theme: str) -> None:
         self._apply_bubble_theme(theme)
-        if self._bubble_showing_favorites and self._favorite_quotes:
-            current_page = (self._favorite_index - 1) % self._favorite_page_count()
+        page_count = self._favorite_page_count()
+        if self._bubble_showing_favorites and self._favorite_quotes and page_count > 0:
+            current_page = (self._favorite_index - 1) % page_count
             self._render_favorite_page(current_page)
 
     @Slot(bool)
