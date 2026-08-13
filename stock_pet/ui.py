@@ -2470,6 +2470,15 @@ class QuotePanel(QWidget):
 
     def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
         selected_symbol = self._current_input_symbol()
+        scroll_positions = [
+            (stock_list, stock_list.verticalScrollBar().value())
+            for stock_list in (
+                self.a_share_list,
+                self.hk_share_list,
+                self.index_list,
+                self.favorite_list,
+            )
+        ]
         names_changed = False
         for quote in quotes:
             self._quote_cache[quote.symbol.provider_symbol] = quote
@@ -2480,6 +2489,9 @@ class QuotePanel(QWidget):
             self._persist_stock_names()
         self._refresh_watchlist_lists()
         self._select_symbol_in_current_list(selected_symbol)
+        for stock_list, position in scroll_positions:
+            scroll_bar = stock_list.verticalScrollBar()
+            scroll_bar.setValue(min(position, scroll_bar.maximum()))
         self._update_market_summary()
         if selected_symbol:
             try:
