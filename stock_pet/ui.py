@@ -100,7 +100,7 @@ ALERT_REARM_MARGIN_PERCENT = 0.2
 ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
 STOCK_NAME_CACHE_SETTINGS_KEY = "stock_name_cache_v1"
 STOCK_NAME_ITEM_ROLE = int(Qt.ItemDataRole.UserRole) + 1
-MARKET_CLOSE_REFRESH_GRACE_MINUTES = 10
+MARKET_CLOSE_REFRESH_GRACE_MINUTES = 30
 MARKET_TIMEZONE = timezone(timedelta(hours=8))
 A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
 HK_MARKETS = {"hk", "hk_index"}

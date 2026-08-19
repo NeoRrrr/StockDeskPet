@@ -457,26 +457,26 @@ class QuotePanelTests(unittest.TestCase):
             )
         )
 
-    def test_automatic_refresh_continues_for_ten_minutes_after_close(self) -> None:
+    def test_automatic_refresh_continues_for_thirty_minutes_after_close(self) -> None:
         thursday = (2026, 8, 6)
         self.assertTrue(
             _is_open_for_automatic_refresh(
-                "159516", datetime(*thursday, 15, 9, tzinfo=MARKET_TIMEZONE)
+                "159516", datetime(*thursday, 15, 29, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertFalse(
             _is_open_for_automatic_refresh(
-                "159516", datetime(*thursday, 15, 10, tzinfo=MARKET_TIMEZONE)
+                "159516", datetime(*thursday, 15, 30, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertTrue(
             _is_open_for_automatic_refresh(
-                "01810", datetime(*thursday, 16, 9, tzinfo=MARKET_TIMEZONE)
+                "01810", datetime(*thursday, 16, 29, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertFalse(
             _is_open_for_automatic_refresh(
-                "01810", datetime(*thursday, 16, 10, tzinfo=MARKET_TIMEZONE)
+                "01810", datetime(*thursday, 16, 30, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertFalse(
