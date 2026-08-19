@@ -434,26 +434,31 @@ class QuotePanelTests(unittest.TestCase):
             pet.panel.close()
             pet.close()
 
-    def test_idle_bubble_hides_markets_after_their_close(self) -> None:
+    def test_idle_bubble_continues_for_thirty_minutes_after_close(self) -> None:
         thursday = (2026, 8, 6)
         self.assertTrue(
             _is_visible_in_idle_bubble(
-                "159516", datetime(*thursday, 14, 59, tzinfo=MARKET_TIMEZONE)
+                "159516", datetime(*thursday, 15, 29, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertFalse(
             _is_visible_in_idle_bubble(
-                "159516", datetime(*thursday, 15, 0, tzinfo=MARKET_TIMEZONE)
+                "159516", datetime(*thursday, 15, 30, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertTrue(
             _is_visible_in_idle_bubble(
-                "01810", datetime(*thursday, 15, 59, tzinfo=MARKET_TIMEZONE)
+                "01810", datetime(*thursday, 16, 29, tzinfo=MARKET_TIMEZONE)
             )
         )
         self.assertFalse(
             _is_visible_in_idle_bubble(
-                "01810", datetime(*thursday, 16, 0, tzinfo=MARKET_TIMEZONE)
+                "01810", datetime(*thursday, 16, 30, tzinfo=MARKET_TIMEZONE)
+            )
+        )
+        self.assertTrue(
+            _is_visible_in_idle_bubble(
+                "01810", datetime(*thursday, 12, 30, tzinfo=MARKET_TIMEZONE)
             )
         )
 

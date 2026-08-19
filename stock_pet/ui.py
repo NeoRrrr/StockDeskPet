@@ -185,9 +185,17 @@ def _is_visible_in_idle_bubble(
 
     minute = current.hour * 60 + current.minute
     if market in A_SHARE_MARKETS:
-        return A_SHARE_SESSIONS[0][0] <= minute < A_SHARE_SESSIONS[-1][1]
+        return (
+            A_SHARE_SESSIONS[0][0]
+            <= minute
+            < A_SHARE_SESSIONS[-1][1] + MARKET_CLOSE_REFRESH_GRACE_MINUTES
+        )
     if market in HK_MARKETS:
-        return HK_SESSIONS[0][0] <= minute < HK_SESSIONS[-1][1]
+        return (
+            HK_SESSIONS[0][0]
+            <= minute
+            < HK_SESSIONS[-1][1] + MARKET_CLOSE_REFRESH_GRACE_MINUTES
+        )
     return True
 
 
