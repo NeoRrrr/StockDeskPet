@@ -20,6 +20,9 @@ from stock_pet.symbols import normalize_symbol
 from stock_pet.ui import (
     DEFAULT_A_SHARE_ETFS,
     DEFAULT_HK_WATCHLIST,
+    FAVORITE_BUBBLE_FONT_MAX_PERCENT,
+    FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+    FAVORITE_BUBBLE_FONT_SETTINGS_KEY,
     FAVORITE_BUBBLE_PAGE_INTERVAL_MS,
     FAVORITE_REFRESH_INTERVAL_MS,
     FavoriteButton,
@@ -30,6 +33,7 @@ from stock_pet.ui import (
     SPRITE_ANIMATIONS,
     TAB_MARKET_SUMMARIES,
     QuotePanel,
+    SettingsDialog,
     StockPetWidget,
     ThemeSwitch,
     WatchlistDialog,
@@ -388,6 +392,7 @@ class QuotePanelTests(unittest.TestCase):
             settings.setValue("a_share_etf_defaults_v1_added", True)
             favorite_symbols = ["159516", "515880", "512200", "512800", "600519", "00700"]
             settings.setValue("favorites", favorite_symbols)
+            settings.setValue(FAVORITE_BUBBLE_FONT_SETTINGS_KEY, 150)
             pet = StockPetWidget(settings)
             pet._animation.stop()
             pet._watch_timer.stop()
@@ -419,7 +424,8 @@ class QuotePanelTests(unittest.TestCase):
             ]
             with patch("stock_pet.ui._is_visible_in_idle_bubble", return_value=True):
                 pet._on_favorite_result((quotes, []))
-                self.assertGreaterEqual(pet.bubble.width(), 280)
+                self.assertGreaterEqual(pet.bubble.width(), 430)
+                self.assertIn("font: 700 17px", pet.bubble.styleSheet())
                 for index in range(1, 6):
                     self.assertIn(f"收藏行情{index}", pet.bubble.text())
                 self.assertNotIn("收藏行情6", pet.bubble.text())
@@ -430,6 +436,38 @@ class QuotePanelTests(unittest.TestCase):
                 self.assertTrue(pet._favorite_carousel_timer.isActive())
                 pet._show_next_favorite()
                 self.assertIn("收藏行情6", pet.bubble.text())
+
+                pet._apply_bubble_settings(5, 10, 80)
+                self.assertEqual(pet.favorite_bubble_font_percent, 80)
+                self.assertEqual(
+                    int(settings.value(FAVORITE_BUBBLE_FONT_SETTINGS_KEY)),
+                    80,
+                )
+                self.assertLessEqual(pet.bubble.width(), 232)
+                self.assertIn("font: 700 9px", pet.bubble.styleSheet())
+
+            dialog = SettingsDialog(settings, pet.provider, parent=pet.panel)
+            changes: list[tuple[int, int, int]] = []
+            dialog.bubble_settings_changed.connect(
+                lambda page_size, interval, font_percent: changes.append(
+                    (page_size, interval, font_percent)
+                )
+            )
+            self.assertEqual(
+                dialog.bubble_font_slider.minimum(),
+                FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+            )
+            self.assertEqual(
+                dialog.bubble_font_slider.maximum(),
+                FAVORITE_BUBBLE_FONT_MAX_PERCENT,
+            )
+            dialog.bubble_font_slider.setValue(140)
+            self.assertEqual(changes[-1][2], 140)
+            self.assertEqual(
+                int(settings.value(FAVORITE_BUBBLE_FONT_SETTINGS_KEY)),
+                140,
+            )
+            dialog.close()
             pet._favorite_carousel_timer.stop()
             pet.panel.close()
             pet.close()

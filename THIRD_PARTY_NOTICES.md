@@ -53,3 +53,32 @@ The upstream Apache 2.0 license text is included as `assets/LICENSE-FutuAPI.txt`
 These spritesheets are included for this user's local build with developer permission
 reported by the user. See `assets/skins/README.md` for hashes and source details. Recheck
 upstream terms before redistributing them.
+
+## DeepSeek Pet expression assets
+
+- Source: https://github.com/keleus/deepseek-pet
+- Author: keleus
+- Upstream commit: `b9b61a35c3b2443ecdeab0ed442d6b33c603d343`
+- License: MIT
+- Files: `assets/skins/deepseek-expressions/*.webp`, copied unchanged from
+  upstream `src/client/assets/`.
+
+The upstream MIT license and copyright notice are included as
+`assets/LICENSE-DeepSeekPet.txt`. The native expression renderer is inspired by
+the upstream whole-image reactions, time-based rotation and lightweight motion;
+the DeepSeek Harness plugin and its web runtime are not bundled.
+
+## DSH Pet animated assets
+
+- Source: https://github.com/PC2005-cloud/dsh-pet
+- Author: PC2005-cloud
+- Upstream commit: `48007b64ac0bebb2e97ac88344aed62de8399dd4`
+- License: MIT, copyright (c) 2026 PC2005-cloud.
+- Files: all 106 original GIFs from upstream `dsh-pet/assets/preview/`, copied
+  unchanged into `assets/skins/dsh-maid/`. The action labels and categories are
+  derived from the upstream configuration and preview filename mapping.
+
+The full upstream license is included as `assets/LICENSE-DSHPet.txt`.
+`manifest.json` records the upstream revision and SHA-256 of every imported GIF.
+The independent Qt player borrows the categorized action menu and idle/action
+chain design; no upstream plugin runtime, AI API, Electron or credentials are used.

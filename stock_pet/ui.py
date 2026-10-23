@@ -5,6 +5,7 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from html import escape
+from time import monotonic
 
 from PySide6.QtCore import QObject, QPoint, QPointF, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap
@@ -36,6 +37,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
+from .animated_skin import AnimatedSkin, DSH_CANVAS_WIDTH, DSH_SKIN_KEY, ONE_SHOT_STATES
+from .expression_skin import EXPRESSION_SKIN_KEY, ExpressionSkin
 from .hybrid_quote_provider import HybridQuoteProvider
 from .models import Quote, StockSearchResult
 from .quote_provider import TencentQuoteProvider
@@ -75,6 +78,8 @@ SKINS: dict[str, tuple[str, str, bool]] = {
     "ikunchick": ("ikunchick", "skins/ikunchick.webp", True),
     "maid-deepseek-whale": ("DeepSeek 鲸鱼女仆", "skins/maid-deepseek-whale.webp", True),
     "deepseek": ("DeepSeek 鲸鱼", "skins/deepseek.webp", True),
+    EXPRESSION_SKIN_KEY: ("DeepSeek 女仆 · 表情版", "skins/deepseek-expressions/deepseek-idle.webp", True),
+    DSH_SKIN_KEY: ("DSH 蓝毛女仆 · 动画版", "skins/dsh-maid/daiji-huxi-xiuxian.gif", True),
 }
 DEFAULT_HK_WATCHLIST = ("00700", "01810")
 DEFAULT_A_SHARE_ETFS = ("159516", "515880", "512200", "512800")
@@ -96,6 +101,12 @@ FAVORITE_BUBBLE_PAGE_SIZE = 5
 FAVORITE_BUBBLE_MAX_PAGE_SIZE = 10
 FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY = "favorite_bubble_page_size"
 FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY = "favorite_bubble_page_interval_seconds"
+FAVORITE_BUBBLE_FONT_PERCENT = 100
+FAVORITE_BUBBLE_FONT_MIN_PERCENT = 80
+FAVORITE_BUBBLE_FONT_MAX_PERCENT = 150
+FAVORITE_BUBBLE_FONT_SETTINGS_KEY = "favorite_bubble_font_percent"
+INITIAL_QUOTE_RETRY_SECONDS = 30
+INITIAL_QUOTE_RETRY_MAX_SECONDS = 300
 ALERT_REARM_MARGIN_PERCENT = 0.2
 ALERT_CACHE_SETTINGS_KEY = "alert_cache_v1"
 STOCK_NAME_CACHE_SETTINGS_KEY = "stock_name_cache_v1"
@@ -1255,7 +1266,7 @@ class WatchlistDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    bubble_settings_changed = Signal(int, int)
+    bubble_settings_changed = Signal(int, int, int)
 
     def __init__(
         self,
@@ -1273,7 +1284,7 @@ class SettingsDialog(QDialog):
         self._release_url = f"{PROJECT_URL}/releases"
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setFixedSize(430, 612)
+        self.setFixedSize(430, 646)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -1353,6 +1364,18 @@ class SettingsDialog(QDialog):
                 ),
             ),
         )
+        saved_font_percent = max(
+            FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+            min(
+                FAVORITE_BUBBLE_FONT_MAX_PERCENT,
+                int(
+                    settings.value(
+                        FAVORITE_BUBBLE_FONT_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_FONT_PERCENT,
+                    )
+                ),
+            ),
+        )
 
         page_size_row = QHBoxLayout()
         page_size_label = QLabel("每页数量")
@@ -1388,14 +1411,38 @@ class SettingsDialog(QDialog):
         interval_row.addWidget(self.bubble_interval_value)
         bubble_layout.addLayout(interval_row)
 
+        font_row = QHBoxLayout()
+        font_label = QLabel("气泡字号")
+        self.bubble_font_slider = QSlider(Qt.Orientation.Horizontal)
+        self.bubble_font_slider.setObjectName("bubbleFontSlider")
+        self.bubble_font_slider.setRange(
+            FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+            FAVORITE_BUBBLE_FONT_MAX_PERCENT,
+        )
+        self.bubble_font_slider.setSingleStep(5)
+        self.bubble_font_slider.setPageStep(10)
+        self.bubble_font_slider.setValue(saved_font_percent)
+        self.bubble_font_value = QLabel(f"{saved_font_percent}%")
+        self.bubble_font_value.setObjectName("bubbleSettingValue")
+        self.bubble_font_value.setFixedWidth(42)
+        self.bubble_font_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        font_row.addWidget(font_label)
+        font_row.addWidget(self.bubble_font_slider, 1)
+        font_row.addWidget(self.bubble_font_value)
+        bubble_layout.addLayout(font_row)
+
         settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, saved_page_size)
         settings.setValue(
             FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
             saved_interval_seconds,
         )
+        settings.setValue(FAVORITE_BUBBLE_FONT_SETTINGS_KEY, saved_font_percent)
         settings.sync()
         self.bubble_page_size_slider.valueChanged.connect(self._on_bubble_settings_changed)
         self.bubble_interval_slider.valueChanged.connect(self._on_bubble_settings_changed)
+        self.bubble_font_slider.valueChanged.connect(self._on_bubble_settings_changed)
         layout.addWidget(bubble_card)
 
         version_card = QFrame()
@@ -1467,13 +1514,16 @@ class SettingsDialog(QDialog):
                 color: #91a5bd; font-size: 12px;
             }
             QSlider#bubblePageSizeSlider::groove:horizontal,
-            QSlider#bubbleIntervalSlider::groove:horizontal {
+            QSlider#bubbleIntervalSlider::groove:horizontal,
+            QSlider#bubbleFontSlider::groove:horizontal {
                 height: 4px; background: #26384d; border-radius: 2px;
             }
             QSlider#bubblePageSizeSlider::sub-page:horizontal,
-            QSlider#bubbleIntervalSlider::sub-page:horizontal { background: #397bec; border-radius: 2px; }
+            QSlider#bubbleIntervalSlider::sub-page:horizontal,
+            QSlider#bubbleFontSlider::sub-page:horizontal { background: #397bec; border-radius: 2px; }
             QSlider#bubblePageSizeSlider::handle:horizontal,
-            QSlider#bubbleIntervalSlider::handle:horizontal {
+            QSlider#bubbleIntervalSlider::handle:horizontal,
+            QSlider#bubbleFontSlider::handle:horizontal {
                 width: 14px; margin: -5px 0; background: #ffffff;
                 border: 1px solid #397bec; border-radius: 7px;
             }
@@ -1517,11 +1567,14 @@ class SettingsDialog(QDialog):
                 }
                 QLabel#cardTitle, QLabel#appName { color: #1f2d42; }
                 QSlider#bubblePageSizeSlider::groove:horizontal,
-                QSlider#bubbleIntervalSlider::groove:horizontal { background: #d3dde9; }
+                QSlider#bubbleIntervalSlider::groove:horizontal,
+                QSlider#bubbleFontSlider::groove:horizontal { background: #d3dde9; }
                 QSlider#bubblePageSizeSlider::sub-page:horizontal,
-                QSlider#bubbleIntervalSlider::sub-page:horizontal { background: #2d6ed8; }
+                QSlider#bubbleIntervalSlider::sub-page:horizontal,
+                QSlider#bubbleFontSlider::sub-page:horizontal { background: #2d6ed8; }
                 QSlider#bubblePageSizeSlider::handle:horizontal,
-                QSlider#bubbleIntervalSlider::handle:horizontal {
+                QSlider#bubbleIntervalSlider::handle:horizontal,
+                QSlider#bubbleFontSlider::handle:horizontal {
                     background: #ffffff; border-color: #2d6ed8;
                 }
                 QComboBox#quoteSourceCombo {
@@ -1549,15 +1602,18 @@ class SettingsDialog(QDialog):
     def _on_bubble_settings_changed(self, _value: int) -> None:
         page_size = self.bubble_page_size_slider.value()
         interval_seconds = self.bubble_interval_slider.value()
+        font_percent = self.bubble_font_slider.value()
         self.bubble_page_size_value.setText(f"{page_size} 条")
         self.bubble_interval_value.setText(f"{interval_seconds} 秒")
+        self.bubble_font_value.setText(f"{font_percent}%")
         self.settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, page_size)
         self.settings.setValue(
             FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
             interval_seconds,
         )
+        self.settings.setValue(FAVORITE_BUBBLE_FONT_SETTINGS_KEY, font_percent)
         self.settings.sync()
-        self.bubble_settings_changed.emit(page_size, interval_seconds)
+        self.bubble_settings_changed.emit(page_size, interval_seconds, font_percent)
 
     @Slot(int)
     def _on_quote_source_changed(self, _index: int) -> None:
@@ -1671,7 +1727,7 @@ class QuotePanel(QWidget):
     page_refresh_requested = Signal(object)
     periodic_page_refresh_requested = Signal(object)
     theme_changed = Signal(str)
-    bubble_settings_changed = Signal(int, int)
+    bubble_settings_changed = Signal(int, int, int)
 
     def __init__(self, provider: TencentQuoteProvider, settings: QSettings) -> None:
         super().__init__()
@@ -2684,9 +2740,10 @@ class QuotePanel(QWidget):
             parent=self,
         )
         dialog.bubble_settings_changed.connect(
-            lambda page_size, interval_seconds: self.bubble_settings_changed.emit(
+            lambda page_size, interval_seconds, font_percent: self.bubble_settings_changed.emit(
                 page_size,
                 interval_seconds,
+                font_percent,
             )
         )
         dialog.exec()
@@ -2947,6 +3004,18 @@ class StockPetWidget(QWidget):
                 ),
             ),
         )
+        self.favorite_bubble_font_percent = max(
+            FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+            min(
+                FAVORITE_BUBBLE_FONT_MAX_PERCENT,
+                int(
+                    self.settings.value(
+                        FAVORITE_BUBBLE_FONT_SETTINGS_KEY,
+                        FAVORITE_BUBBLE_FONT_PERCENT,
+                    )
+                ),
+            ),
+        )
         self.settings.setValue(
             FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
             self.favorite_bubble_page_size,
@@ -2955,12 +3024,17 @@ class StockPetWidget(QWidget):
             FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
             self.favorite_bubble_page_interval_seconds,
         )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_FONT_SETTINGS_KEY,
+            self.favorite_bubble_font_percent,
+        )
         self.settings.sync()
         self._watch_task: WatchlistTask | None = None
         self._watch_manual = False
         self._watch_animate = False
         self._pending_page_symbols: list[str] | None = None
         self._page_refresh_initialized_keys: set[str] = set()
+        self._page_initial_retries: dict[str, tuple[int, float]] = {}
         (
             self._alert_states,
             self._alert_last_percent,
@@ -2972,6 +3046,7 @@ class StockPetWidget(QWidget):
         self._favorite_task: WatchlistTask | None = None
         self._favorite_refresh_pending = False
         self._favorite_refresh_initialized_keys: set[str] = set()
+        self._favorite_initial_retries: dict[str, tuple[int, float]] = {}
         self._favorite_quotes: list[Quote] = []
         self._favorite_index = 0
         self._favorite_refresh_timer = QTimer(self)
@@ -3004,6 +3079,8 @@ class StockPetWidget(QWidget):
         self.pet_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.current_skin = "default"
         self._skin_sheet: QPixmap | None = None
+        self._expression_skin: ExpressionSkin | None = None
+        self._animated_skin: AnimatedSkin | None = None
         self._skin_animation = "idle"
         self._skin_animation_after_once: str | None = None
         self._skin_frame = 0
@@ -3016,7 +3093,7 @@ class StockPetWidget(QWidget):
         self._animation_tick = 0
         self._animation = QTimer(self)
         self._animation.timeout.connect(self._animate)
-        self._animation.start(50)
+        self._animation.setInterval(50)
 
         self._configure_favorite_timers()
         self._show_favorite_prompt()
@@ -3029,7 +3106,7 @@ class StockPetWidget(QWidget):
             self.move(screen.right() - self.width() - 24, screen.bottom() - self.height() - 24)
 
         self.setCursor(QCursor(Qt.PointingHandCursor))
-        self.setToolTip("单击显示或隐藏行情卡；拖动可移动；右键切换皮肤")
+        self.setToolTip("单击显示或隐藏行情卡；拖动可移动；右键切换皮肤、播放动作")
         if self.favorite_symbols:
             QTimer.singleShot(1_000, self.refresh_favorites)
         QTimer.singleShot(5_000, self.scan_watchlist)
@@ -3050,7 +3127,42 @@ class StockPetWidget(QWidget):
         self._skin_animation = "refresh" if self._refresh_activity_sources else "idle"
         self._skin_animation_after_once = None
         self._skin_frame = 0
-        if animated:
+        self._skin_sheet = None
+        self._expression_skin = None
+        if self._animated_skin is not None:
+            self._animated_skin.close()
+            self._animated_skin.deleteLater()
+            self._animated_skin = None
+        if skin_key == DSH_SKIN_KEY:
+            try:
+                self._animated_skin = AnimatedSkin(
+                    self.devicePixelRatioF(),
+                    random_idle=self.settings.value("pet_random_idle", True, type=bool),
+                    parent=self,
+                )
+                self._animated_skin.frame_ready.connect(self.pet_label.setPixmap)
+                self._animated_skin.completed.connect(self._on_animated_cycle)
+                self._animated_skin.failed.connect(self._on_animated_skin_error, Qt.QueuedConnection)
+                self._animated_skin.set_animation(self._skin_animation)
+                self._animated_skin.set_active(self.isVisible())
+                self._render_skin_frame()
+            except (OSError, ValueError, KeyError):
+                if self._animated_skin is not None:
+                    self._animated_skin.close()
+                    self._animated_skin.deleteLater()
+                self._animated_skin = None
+                self.current_skin = "default"
+                self._set_pet_image(SKINS["default"][1])
+        elif skin_key == EXPRESSION_SKIN_KEY:
+            try:
+                self._expression_skin = ExpressionSkin(self.devicePixelRatioF())
+                self._expression_skin.set_animation(self._skin_animation)
+                self._render_skin_frame()
+            except OSError:
+                self.current_skin = "default"
+                self._expression_skin = None
+                self._set_pet_image(SKINS["default"][1])
+        elif animated:
             sheet = QPixmap(str(asset_path(filename)))
             expected_width = SPRITE_CELL_WIDTH * 8
             expected_height = SPRITE_CELL_HEIGHT * 9
@@ -3068,13 +3180,20 @@ class StockPetWidget(QWidget):
         if persist:
             self.settings.setValue("skin", self.current_skin)
             self.settings.sync()
-            if self._favorite_quotes:
-                current_page = (self._favorite_index - 1) % self._favorite_page_count()
+            page_count = self._favorite_page_count()
+            if self._favorite_quotes and page_count > 0:
+                current_page = (self._favorite_index - 1) % page_count
                 self._render_favorite_page(current_page)
             else:
                 self._show_favorite_prompt()
 
     def _render_skin_frame(self) -> None:
+        if self._animated_skin is not None:
+            self.pet_label.setPixmap(self._animated_skin.render())
+            return
+        if self._expression_skin is not None:
+            self.pet_label.setPixmap(self._expression_skin.render())
+            return
         if self._skin_sheet is None:
             return
         row, frame_count, _loops = SPRITE_ANIMATIONS[self._skin_animation]
@@ -3105,9 +3224,52 @@ class StockPetWidget(QWidget):
         self._skin_animation = animation
         self._skin_animation_after_once = after_once
         self._skin_frame = 0
+        if self._animated_skin is not None:
+            if not self._animated_skin.set_animation(animation, restart=restart):
+                self.set_skin("default")
+                return
+        if self._expression_skin is not None:
+            self._expression_skin.set_animation(animation, restart=restart)
         self._render_skin_frame()
 
+    @Slot()
+    def _on_animated_cycle(self) -> None:
+        if self.sender() is not self._animated_skin:
+            return
+        target = "refresh" if self._refresh_activity_sources else "idle"
+        self._play_skin_animation(target, restart=True)
+
+    @Slot(str)
+    def _on_animated_skin_error(self, message: str) -> None:
+        if self.sender() is self._animated_skin:
+            self.set_skin("default")
+            self.setToolTip(message)
+
+    def _play_named_action(self, name: str) -> None:
+        if self._animated_skin is not None and self._animated_skin.play_action(name):
+            self._skin_animation = "action"
+            self._skin_animation_after_once = None
+
+    def _set_random_idle(self, enabled: bool) -> None:
+        self.settings.setValue("pet_random_idle", enabled)
+        self.settings.sync()
+        if self._animated_skin is not None:
+            self._animated_skin.set_random_idle(enabled)
+
+    def _stop_named_action(self) -> None:
+        target = "refresh" if self._refresh_activity_sources else "idle"
+        self._play_skin_animation(target, restart=True)
+
     def _advance_skin_frame(self) -> None:
+        if self._expression_skin is not None:
+            if self._expression_skin.finished:
+                next_animation = self._skin_animation_after_once
+                if next_animation is None:
+                    next_animation = "refresh" if self._refresh_activity_sources else "idle"
+                self._play_skin_animation(next_animation, restart=True)
+            else:
+                self._render_skin_frame()
+            return
         if self._skin_sheet is None:
             return
         _row, frame_count, loops = SPRITE_ANIMATIONS[self._skin_animation]
@@ -3131,7 +3293,9 @@ class StockPetWidget(QWidget):
         else:
             self._refresh_activity_sources.discard(source)
         target = "refresh" if self._refresh_activity_sources else "idle"
-        if self._skin_animation == "click":
+        if self._skin_animation == "click" or (
+            self._animated_skin is not None and self._skin_animation in ONE_SHOT_STATES
+        ):
             self._skin_animation_after_once = target
         elif self._skin_animation not in {"drag_left", "drag_right"}:
             self._play_skin_animation(target)
@@ -3143,40 +3307,49 @@ class StockPetWidget(QWidget):
 
     def _resize_for_bubble(self, line_count: int) -> None:
         pet_global = self.mapToGlobal(self.pet_label.pos())
+        pet_center_x = pet_global.x() + self.pet_label.width() // 2
+        pet_width = DSH_CANVAS_WIDTH if self._animated_skin is not None else 156
         if line_count <= 0:
             self.bubble.hide()
             self._pet_image_x = 8
             self._pet_image_y = 4
-            self.setFixedSize(172, 158)
-            self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, 156, 150)
+            self.setFixedSize(pet_width + 16, 158)
+            self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, pet_width, 150)
             if self.isVisible():
                 self.move(
-                    pet_global.x() - self._pet_image_x,
+                    pet_center_x - pet_width // 2 - self._pet_image_x,
                     pet_global.y() - self._pet_image_y,
                 )
                 self._clamp_to_screen()
             return
 
-        bubble_height = 64 if line_count <= 2 else 20 + line_count * 18
+        scale = self.favorite_bubble_font_percent / FAVORITE_BUBBLE_FONT_PERCENT
+        bubble_width = round(288 * scale)
+        base_height = 64 if line_count <= 2 else 20 + line_count * 18
+        bubble_height = round(base_height * scale)
+        widget_width = max(bubble_width + 12, pet_width + 16)
         self.bubble.show()
-        self._pet_image_x = 72
+        self._pet_image_x = (widget_width - pet_width) // 2
         self._pet_image_y = bubble_height + 8
-        self.setFixedSize(300, self._pet_image_y + 158)
-        self.bubble.setGeometry(6, 4, 288, bubble_height)
-        self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, 156, 150)
+        self.setFixedSize(widget_width, self._pet_image_y + 158)
+        self.bubble.setGeometry((widget_width - bubble_width) // 2, 4, bubble_width, bubble_height)
+        self.pet_label.setGeometry(self._pet_image_x, self._pet_image_y, pet_width, 150)
         if self.isVisible():
             self.move(
-                pet_global.x() - self._pet_image_x,
+                pet_center_x - pet_width // 2 - self._pet_image_x,
                 pet_global.y() - self._pet_image_y,
             )
             self._clamp_to_screen()
 
+    def _can_show_favorite_bubble(self) -> bool:
+        return self.favorite_bubble_page_size > 0 and any(
+            _is_visible_in_idle_bubble(symbol) for symbol in self.favorite_symbols
+        )
+
     def _show_favorite_prompt(self) -> None:
         self._bubble_showing_favorites = False
         self._bubble_direction = 0
-        if self.favorite_bubble_page_size <= 0 or not self.favorite_symbols or not any(
-            _is_visible_in_idle_bubble(symbol) for symbol in self.favorite_symbols
-        ):
+        if not self._can_show_favorite_bubble():
             self._hide_favorite_bubble()
             return
         self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3185,6 +3358,7 @@ class StockPetWidget(QWidget):
         self._apply_bubble_theme(self.panel.current_theme)
 
     def _hide_favorite_bubble(self) -> None:
+        self._favorite_carousel_timer.stop()
         self._bubble_showing_favorites = False
         self._bubble_direction = 0
         self.bubble.clear()
@@ -3290,6 +3464,10 @@ class StockPetWidget(QWidget):
             normalize_symbol(code).provider_symbol for code in self.favorite_symbols
         }
         self._favorite_refresh_initialized_keys.intersection_update(favorite_keys)
+        self._favorite_initial_retries = {
+            key: retry for key, retry in self._favorite_initial_retries.items()
+            if key in favorite_keys
+        }
         self._favorite_quotes = [
             quote
             for quote in self._favorite_quotes
@@ -3310,8 +3488,13 @@ class StockPetWidget(QWidget):
         else:
             self.refresh_favorites()
 
-    @Slot(int, int)
-    def _apply_bubble_settings(self, page_size: int, interval_seconds: int) -> None:
+    @Slot(int, int, int)
+    def _apply_bubble_settings(
+        self,
+        page_size: int,
+        interval_seconds: int,
+        font_percent: int,
+    ) -> None:
         self.favorite_bubble_page_size = max(
             0,
             min(FAVORITE_BUBBLE_MAX_PAGE_SIZE, int(page_size)),
@@ -3320,6 +3503,10 @@ class StockPetWidget(QWidget):
             1,
             min(30, int(interval_seconds)),
         )
+        self.favorite_bubble_font_percent = max(
+            FAVORITE_BUBBLE_FONT_MIN_PERCENT,
+            min(FAVORITE_BUBBLE_FONT_MAX_PERCENT, int(font_percent)),
+        )
         self.settings.setValue(
             FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY,
             self.favorite_bubble_page_size,
@@ -3327,6 +3514,10 @@ class StockPetWidget(QWidget):
         self.settings.setValue(
             FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
             self.favorite_bubble_page_interval_seconds,
+        )
+        self.settings.setValue(
+            FAVORITE_BUBBLE_FONT_SETTINGS_KEY,
+            self.favorite_bubble_font_percent,
         )
         self.settings.sync()
         self._favorite_carousel_timer.stop()
@@ -3347,9 +3538,9 @@ class StockPetWidget(QWidget):
     @Slot()
     def refresh_favorites(self) -> None:
         if not self.favorite_symbols:
+            self._hide_favorite_bubble()
             return
-        if self._favorite_quotes and self.favorite_bubble_page_size <= 0:
-            self._favorite_carousel_timer.stop()
+        if not self._can_show_favorite_bubble():
             self._favorite_index = 0
             self._hide_favorite_bubble()
         elif self._favorite_quotes:
@@ -3366,6 +3557,7 @@ class StockPetWidget(QWidget):
         symbols = self._automatic_symbols_with_initialization(
             self.favorite_symbols,
             self._favorite_refresh_initialized_keys,
+            self._favorite_initial_retries,
         )
         if not symbols:
             return
@@ -3377,6 +3569,7 @@ class StockPetWidget(QWidget):
     @Slot(object)
     def _on_favorite_result(self, result: tuple[list[Quote], list[str]]) -> None:
         quotes, errors = result
+        requested_symbols = self._favorite_task.symbols if self._favorite_task else []
         self._favorite_task = None
         favorite_keys = {
             normalize_symbol(code).provider_symbol for code in self.favorite_symbols
@@ -3384,6 +3577,13 @@ class StockPetWidget(QWidget):
         refreshed_quotes = [
             quote for quote in quotes if quote.symbol.provider_symbol in favorite_keys
         ]
+        self._record_initial_refresh_result(
+            [symbol for symbol in requested_symbols
+             if normalize_symbol(symbol).provider_symbol in favorite_keys],
+            refreshed_quotes,
+            self._favorite_refresh_initialized_keys,
+            self._favorite_initial_retries,
+        )
         if refreshed_quotes:
             previous_by_key = {
                 quote.symbol.provider_symbol: quote for quote in self._favorite_quotes
@@ -3402,28 +3602,30 @@ class StockPetWidget(QWidget):
                 )
                 is not None
             ]
-            page_count = self._favorite_page_count()
             self.panel.update_watchlist_quotes(refreshed_quotes)
-            if page_count <= 0:
-                self._favorite_index = 0
-                self._favorite_carousel_timer.stop()
-                self._hide_favorite_bubble()
+
+        # Async results must respect settings/favorites/market time at completion.
+        # Still retain successful quotes above while their bubble is hidden.
+        if not self._can_show_favorite_bubble():
+            self._favorite_index = 0
+            self._hide_favorite_bubble()
+        elif refreshed_quotes:
+            page_count = self._favorite_page_count()
+            self._favorite_index %= page_count
+            if self._bubble_showing_favorites:
+                current_page = (self._favorite_index - 1) % page_count
+                self._render_favorite_page(current_page)
+                self._favorite_index = (current_page + 1) % page_count
             else:
-                self._favorite_index %= page_count
-                if self._bubble_showing_favorites:
-                    current_page = (self._favorite_index - 1) % page_count
-                    self._render_favorite_page(current_page)
-                    self._favorite_index = (current_page + 1) % page_count
-                else:
-                    self._show_next_favorite()
-                if page_count > 1:
-                    if not self._favorite_carousel_timer.isActive():
-                        self._favorite_carousel_timer.start(
-                            self.favorite_bubble_page_interval_seconds * 1_000
-                        )
-                else:
-                    self._favorite_carousel_timer.stop()
-        elif not self._favorite_quotes:
+                self._show_next_favorite()
+            if page_count > 1:
+                if not self._favorite_carousel_timer.isActive():
+                    self._favorite_carousel_timer.start(
+                        self.favorite_bubble_page_interval_seconds * 1_000
+                    )
+            else:
+                self._favorite_carousel_timer.stop()
+        elif not self._favorite_quotes and errors:
             self._bubble_showing_favorites = False
             self._bubble_direction = 0
             self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3432,6 +3634,8 @@ class StockPetWidget(QWidget):
             self._apply_bubble_theme(self.panel.current_theme)
         elif errors:
             self._show_next_favorite()
+        elif not self._favorite_quotes:
+            self._show_favorite_prompt()
 
         if self._favorite_refresh_pending:
             self._favorite_refresh_pending = False
@@ -3440,6 +3644,7 @@ class StockPetWidget(QWidget):
     @Slot(object)
     def _apply_quote(self, quote: Quote) -> None:
         self._page_refresh_initialized_keys.add(quote.symbol.provider_symbol)
+        self._page_initial_retries.pop(quote.symbol.provider_symbol, None)
 
     @Slot(str)
     def _apply_bubble_theme(self, theme: str) -> None:
@@ -3452,9 +3657,13 @@ class StockPetWidget(QWidget):
             foreground = "#40516a" if is_light else "#c7d1de"
         background = "rgba(247, 249, 252, 246)" if is_light else "rgba(10, 18, 28, 242)"
         border = "rgba(98, 125, 160, 110)" if is_light else "rgba(67, 91, 122, 190)"
+        font_pixels = max(
+            9,
+            (11 * self.favorite_bubble_font_percent + 50) // 100,
+        )
         self.bubble.setStyleSheet(
             f"color: {foreground}; background: {background}; border: 1px solid {border};"
-            "border-radius: 13px; font: 700 11px 'Noto Sans SC'; padding: 2px;"
+            f"border-radius: 13px; font: 700 {font_pixels}px 'Noto Sans SC'; padding: 2px;"
         )
 
     @Slot(str)
@@ -3506,6 +3715,10 @@ class StockPetWidget(QWidget):
             for code in [*self.watchlist, *INDEX_SYMBOLS]
         }
         self._page_refresh_initialized_keys.intersection_update(refresh_keys)
+        self._page_initial_retries = {
+            key: retry for key, retry in self._page_initial_retries.items()
+            if key in refresh_keys
+        }
         self._configure_watch_timer()
         if alerts_enabled and watchlist:
             self.scan_watchlist()
@@ -3545,6 +3758,7 @@ class StockPetWidget(QWidget):
             request_symbols = self._automatic_symbols_with_initialization(
                 request_symbols,
                 self._page_refresh_initialized_keys,
+                self._page_initial_retries,
             )
         if not request_symbols:
             return
@@ -3563,31 +3777,58 @@ class StockPetWidget(QWidget):
     def _automatic_symbols_with_initialization(
         symbols: list[str] | tuple[str, ...],
         initialized_keys: set[str],
+        retries: dict[str, tuple[int, float]],
     ) -> list[str]:
         request_symbols: list[str] = []
+        now = monotonic()
         for raw_symbol in dict.fromkeys(str(symbol) for symbol in symbols):
             try:
                 key = normalize_symbol(raw_symbol).provider_symbol
             except SymbolError:
                 continue
-            if key in initialized_keys and not _is_open_for_automatic_refresh(raw_symbol):
-                continue
-            initialized_keys.add(key)
+            if not _is_open_for_automatic_refresh(raw_symbol):
+                if key in initialized_keys or now < retries.get(key, (0, 0.0))[1]:
+                    continue
             request_symbols.append(raw_symbol)
         return request_symbols
+
+    @staticmethod
+    def _record_initial_refresh_result(
+        requested_symbols: list[str],
+        quotes: list[Quote],
+        initialized_keys: set[str],
+        retries: dict[str, tuple[int, float]],
+    ) -> None:
+        successful_keys = {quote.symbol.provider_symbol for quote in quotes}
+        initialized_keys.update(successful_keys)
+        for key in successful_keys:
+            retries.pop(key, None)
+        now = monotonic()
+        for symbol in requested_symbols:
+            key = normalize_symbol(symbol).provider_symbol
+            if key in initialized_keys:
+                continue
+            attempts = min(retries.get(key, (0, 0.0))[0] + 1, 5)
+            delay = min(
+                INITIAL_QUOTE_RETRY_MAX_SECONDS,
+                INITIAL_QUOTE_RETRY_SECONDS * 2 ** (attempts - 1),
+            )
+            retries[key] = (attempts, now + delay)
 
     @Slot(object)
     def _on_watchlist_result(self, result: tuple[list[Quote], list[str]]) -> None:
         quotes, errors = result
         manual = self._watch_manual
         animate = self._watch_animate
+        requested_symbols = self._watch_task.symbols if self._watch_task else []
         self._watch_task = None
         self._watch_manual = False
         self._watch_animate = False
         if animate:
             self._set_refresh_activity("page", False)
-        self._page_refresh_initialized_keys.update(
-            quote.symbol.provider_symbol for quote in quotes
+        self._record_initial_refresh_result(
+            requested_symbols, quotes, self._page_refresh_initialized_keys,
+            self._page_initial_retries,
         )
         self.panel.update_watchlist_quotes(quotes)
 
@@ -3757,6 +3998,11 @@ class StockPetWidget(QWidget):
             event.accept()
 
     def _show_menu(self, global_pos: QPoint) -> None:
+        menu = self._build_pet_menu()
+        menu.exec(global_pos)
+        menu.deleteLater()
+
+    def _build_pet_menu(self) -> QMenu:
         menu = QMenu(self)
         open_panel = QAction("打开行情卡", menu)
         skin_menu = QMenu("切换皮肤", menu)
@@ -3775,10 +4021,29 @@ class StockPetWidget(QWidget):
             )
             skin_menu.addAction(skin_action)
         menu.addMenu(skin_menu)
+        if self._animated_skin is not None:
+            actions_menu = menu.addMenu("播放动作")
+            for group in self._animated_skin.groups:
+                group_menu = actions_menu.addMenu(group["name"])
+                names = group["actions"]
+                # Keep every menu short enough for normal laptop screen heights.
+                for start in range(0, len(names), 14):
+                    section = group_menu if len(names) <= 14 else group_menu.addMenu(
+                        f"{start + 1}–{min(start + 14, len(names))}"
+                    )
+                    for name in names[start:start + 14]:
+                        action = section.addAction(name)
+                        action.triggered.connect(lambda checked=False, selected=name: self._play_named_action(selected))
+            actions_menu.addSeparator()
+            actions_menu.addAction("停止动作，回到待机", self._stop_named_action)
+            random_action = menu.addAction("待机随机小动作")
+            random_action.setCheckable(True)
+            random_action.setChecked(self._animated_skin.random_idle)
+            random_action.toggled.connect(self._set_random_idle)
         menu.addSeparator()
         menu.addAction(hide)
         menu.addAction(quit_action)
-        menu.exec(global_pos)
+        return menu
 
     @Slot()
     def show_panel(self) -> None:
@@ -3811,6 +4076,19 @@ class StockPetWidget(QWidget):
         self.panel.hide()
         self.hide()
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._animation.start()
+        if self._animated_skin is not None:
+            self._animated_skin.set_active(True)
+        self._animate()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._animation.stop()
+        if self._animated_skin is not None:
+            self._animated_skin.set_active(False)
+        super().hideEvent(event)
+
     def _clamp_to_screen(self) -> None:
         screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
         available = screen.availableGeometry()
@@ -3819,10 +4097,18 @@ class StockPetWidget(QWidget):
         self.move(x, y)
 
     def _animate(self) -> None:
+        if not self.isVisible():
+            return
         self._animation_tick += 1
-        if self._skin_sheet is not None and self._animation_tick % SPRITE_FRAME_TICKS == 0:
+        if self._expression_skin is not None:
             self._advance_skin_frame()
-        offset = round(math.sin(self._animation_tick / 8.0) * 3) if self._skin_animation == "idle" else 0
+        elif self._skin_sheet is not None and self._animation_tick % SPRITE_FRAME_TICKS == 0:
+            self._advance_skin_frame()
+        offset = (
+            round(math.sin(self._animation_tick / 8.0) * 3)
+            if self._skin_animation == "idle" and self._expression_skin is None
+            and self._animated_skin is None else 0
+        )
         self.pet_label.move(self._pet_image_x, self._pet_image_y + offset)
 
 
