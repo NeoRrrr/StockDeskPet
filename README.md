@@ -43,7 +43,7 @@ Windows 股票桌宠 MVP：点击桌宠显示或隐藏行情卡。支持港股�
 - 港股示例：`00700`、`700`、`HK00700`、`0700.HK`
 - A 股示例：`600519`、`SH600519`、`600519.SS`、`000001`、`SZ000001`
 - 行情涨跌不会自动更换皮肤；中国市场配色为红涨绿跌
-- 右键桌宠可在默认牛、Ella Wave、GUGUGAGA、ikunchick、DeepSeek 鲸鱼女仆和 DeepSeek 鲸鱼之间切换，选择会自动保存
+- 默认皮肤为“DSH 蓝毛女仆 · 动画版”；已有用户手动选择的皮肤会保留，右键可切换其他皮肤，选择会自动保存。原“默认牛”更名为“经典牛”，仍可选择，也作为动画资源不可用时的兜底
 - CodexPet 图集皮肤支持状态动画：待机、手动刷新、左右拖拽和点击挥手
 - 新增“DeepSeek 女仆 · 表情版”：采用 [keleus/deepseek-pet](https://github.com/keleus/deepseek-pet) 的 MIT 授权高清表情素材，支持待机轮换/眨眼、点击庆祝、拖拽受惊、手动刷新时工作；长时间待机会变为饥饿、抱枕和睡觉状态
 - 新增“DSH 蓝毛女仆 · 动画版”：采用 [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet) 的 106 段原版透明 GIF；右键「播放动作」按互动、玩耍、吃东西、时节等分类点播，播完自动回到待机。单击仍切换行情卡，同时随机播放点击回应；拖拽有悬空反馈，手动刷新播放工作动作。
@@ -163,7 +163,7 @@ python -m unittest discover -s tests -v
 
 ## 素材
 
-默认牛、熊和涨跌图标来自 Microsoft Fluent UI Emoji GitHub 仓库；五套本机皮肤来自 CodexPet.xyz。来源、许可说明和文件哈希见 `THIRD_PARTY_NOTICES.md` 与 `assets/skins/README.md`。
+经典牛、熊和涨跌图标来自 Microsoft Fluent UI Emoji GitHub 仓库；五套本机皮肤来自 CodexPet.xyz。DSH 蓝毛女仆动画来自 PC2005-cloud/dsh-pet。来源、许可说明和文件哈希见 `THIRD_PARTY_NOTICES.md` 与 `assets/skins/README.md`。
 
 ## 许可证
 

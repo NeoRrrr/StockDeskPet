@@ -71,8 +71,9 @@ SPRITE_ANIMATIONS: dict[str, tuple[int, int, bool]] = {
     "refresh": (7, 6, True),
     "review": (8, 6, False),
 }
+DEFAULT_SKIN_KEY = DSH_SKIN_KEY
 SKINS: dict[str, tuple[str, str, bool]] = {
-    "default": ("默认牛", "ox_3d.png", False),
+    "default": ("经典牛", "ox_3d.png", False),
     "ella-wave": ("Ella Wave", "skins/ella-wave.webp", True),
     "endminguga": ("GUGUGAGA", "skins/endminguga.webp", True),
     "ikunchick": ("ikunchick", "skins/ikunchick.webp", True),
@@ -3109,7 +3110,7 @@ class StockPetWidget(QWidget):
         self._skin_animation_after_once: str | None = None
         self._skin_frame = 0
         self._refresh_activity_sources: set[str] = set()
-        self.set_skin(str(self.settings.value("skin", "default")), persist=False)
+        self.set_skin(str(self.settings.value("skin", DEFAULT_SKIN_KEY)), persist=False)
 
         self._press_global: QPoint | None = None
         self._press_window: QPoint | None = None
@@ -3145,7 +3146,7 @@ class StockPetWidget(QWidget):
 
     def set_skin(self, skin_key: str, persist: bool = True) -> None:
         if skin_key not in SKINS:
-            skin_key = "default"
+            skin_key = DEFAULT_SKIN_KEY
         display_name, filename, animated = SKINS[skin_key]
         self.current_skin = skin_key
         self._skin_animation = "refresh" if self._refresh_activity_sources else "idle"
@@ -3389,10 +3390,12 @@ class StockPetWidget(QWidget):
         self._resize_for_bubble(0)
 
     def _visible_favorite_quotes(self) -> list[Quote]:
+        # Trading-window helpers accept canonical codes (HSTECH/GOLD), not
+        # provider-specific identifiers (hkHSTECH/hf_XAU).
         return [
             quote
             for quote in self._favorite_quotes
-            if _is_visible_in_idle_bubble(quote.symbol.provider_symbol)
+            if _is_visible_in_idle_bubble(quote.symbol.code)
         ]
 
     def _set_bubble_quote(self, quote: Quote, *, favorite: bool = False) -> None:
