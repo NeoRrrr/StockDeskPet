@@ -538,6 +538,7 @@ class QuoteRowWidget(QWidget):
         self.text_label = QLabel(text)
         self.text_label.setObjectName("quoteRowText")
         self.text_label.setStyleSheet(f"color: {color};")
+        self._text_color = color
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(self.text_label, 1)
 
@@ -546,6 +547,14 @@ class QuoteRowWidget(QWidget):
         self.favorite_button.setAccessibleName(self.favorite_button.toolTip())
         self.favorite_button.clicked.connect(self._toggle_favorite)
         layout.addWidget(self.favorite_button)
+
+    def update_quote(self, text: str, color: str) -> None:
+        # Avoid re-polishing unchanged labels on every polling response.
+        if self.text_label.text() != text:
+            self.text_label.setText(text)
+        if self._text_color != color:
+            self._text_color = color
+            self.text_label.setStyleSheet(f"color: {color};")
 
     @Slot(bool)
     def _toggle_favorite(self, favorite: bool) -> None:
@@ -1785,6 +1794,7 @@ class QuotePanel(QWidget):
         if self.current_theme not in {"dark", "beige"}:
             self.current_theme = "dark"
         self._quote_cache: dict[str, Quote] = {}
+        self._quote_rows: dict[str, list[tuple[QListWidgetItem, QuoteRowWidget, bool]]] = {}
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -2181,6 +2191,20 @@ class QuotePanel(QWidget):
         self.settings.setValue("theme", self.current_theme)
         self.settings.sync()
         self._apply_theme()
+        self._update_quote_rows(set(self._quote_rows))
+        for entries in self._quote_rows.values():
+            for _item, row, _compact in entries:
+                row.favorite_button.theme = self.current_theme
+                row.favorite_button.update()
+        for index in range(self.index_list.count()):
+            item = self.index_list.item(index)
+            if not item.data(Qt.ItemDataRole.UserRole):
+                item.setForeground(QColor("#64758a" if theme == "beige" else "#8799af"))
+        for stock_list in (self.a_share_list, self.hk_share_list, self.favorite_list):
+            for index in range(stock_list.count()):
+                item = stock_list.item(index)
+                if not item.data(Qt.ItemDataRole.UserRole):
+                    item.setForeground(QColor("#7a899b" if theme == "beige" else "#74869d"))
         self.update_watchlist_quotes([])
         theme_name = "浅色" if self.current_theme == "beige" else "深色"
         self.status_label.setText(f"已切换为{theme_name}主题")
@@ -2467,6 +2491,9 @@ class QuotePanel(QWidget):
             divider.setVisible(index < len(summary_items) - 1)
 
     def _refresh_watchlist_lists(self) -> None:
+        # Only structural edits rebuild widgets. Drop references before clear()
+        # deletes the old QListWidgetItems and schedules their widgets for deletion.
+        self._quote_rows.clear()
         a_shares, hk_shares = partition_watchlist(self.watchlist)
         self._populate_market_list(self.a_share_list, a_shares, "暂无大A自选，点击“编辑自选”添加")
         self._populate_market_list(self.hk_share_list, hk_shares, "暂无港股自选，点击“编辑自选”添加")
@@ -2480,7 +2507,9 @@ class QuotePanel(QWidget):
         self.market_tabs.setTabText(1, f"港股 ({len(hk_shares)})")
         self.market_tabs.setTabText(2, f"指数 ({len(INDEX_SYMBOLS)})")
         self.market_tabs.setTabText(3, f"收藏 ({len(self.favorite_symbols)})")
+        self._prune_quote_cache()
 
+    def _prune_quote_cache(self) -> None:
         active_keys = {
             normalize_symbol(code).provider_symbol
             for code in [*self.watchlist, *self.favorite_symbols, *INDEX_SYMBOLS]
@@ -2506,22 +2535,7 @@ class QuotePanel(QWidget):
             self.index_list.addItem(header)
             for code in symbols:
                 symbol = normalize_symbol(code)
-                quote = self._quote_cache.get(symbol.provider_symbol)
-                if quote is None:
-                    text = f"  {symbol.display_code}  ·  {symbol.market_label}"
-                    color = self._flat_color()
-                else:
-                    arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
-                    prefix = _currency_prefix(quote.symbol.currency)
-                    text = (
-                        f"  {quote.name}  ·  {quote.symbol.display_code}    "
-                        f"{arrow} {quote.change_percent:+.2f}%    {prefix}{_price(quote.price)}"
-                    )
-                    color = (
-                        self._up_color()
-                        if quote.direction > 0
-                        else self._down_color() if quote.direction < 0 else self._flat_color()
-                    )
+                text, color = self._quote_row_content(code, compact=True)
                 item = QListWidgetItem("")
                 item.setData(Qt.ItemDataRole.UserRole, code)
                 item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
@@ -2556,18 +2570,7 @@ class QuotePanel(QWidget):
         favorite_keys = self._favorite_keys()
         for code in symbols:
             symbol = normalize_symbol(code)
-            quote = self._quote_cache.get(symbol.provider_symbol)
-            if quote is None:
-                text = f"{symbol.display_code}  ·  {symbol.market_label}"
-                color = self._flat_color()
-            else:
-                arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
-                currency = _currency_prefix(quote.symbol.currency)
-                text = (
-                    f"{quote.name}  ·  {quote.symbol.display_code}    "
-                    f"{arrow} {quote.change_percent:+.2f}%    {currency}{_price(quote.price)}"
-                )
-                color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
+            text, color = self._quote_row_content(code)
             item = QListWidgetItem("")
             item.setData(Qt.ItemDataRole.UserRole, code)
             item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
@@ -2583,6 +2586,31 @@ class QuotePanel(QWidget):
                 color,
                 symbol.provider_symbol in favorite_keys,
             )
+
+    def _quote_row_content(self, raw_symbol: str, *, compact: bool = False) -> tuple[str, str]:
+        symbol = normalize_symbol(raw_symbol)
+        quote = self._quote_cache.get(symbol.provider_symbol)
+        indent = "  " if compact else ""
+        if quote is None:
+            return f"{indent}{symbol.display_code}  ·  {symbol.market_label}", self._flat_color()
+        arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
+        currency = _currency_prefix(quote.symbol.currency)
+        text = (
+            f"{indent}{quote.name}  ·  {quote.symbol.display_code}    "
+            f"{arrow} {quote.change_percent:+.2f}%    {currency}{_price(quote.price)}"
+        )
+        color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
+        return text, color
+
+    def _update_quote_rows(self, symbol_keys: set[str]) -> None:
+        for key in symbol_keys:
+            for item, row, compact in self._quote_rows.get(key, ()):
+                text, color = self._quote_row_content(row.symbol, compact=compact)
+                row.update_quote(text, color)
+                if item.data(Qt.ItemDataRole.AccessibleTextRole) != text:
+                    item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
+                if item.foreground().color() != QColor(color):
+                    item.setForeground(QColor(color))
 
     def _favorite_keys(self) -> set[str]:
         return {
@@ -2615,6 +2643,8 @@ class QuotePanel(QWidget):
         )
         row.favorite_toggled.connect(self.toggle_favorite)
         stock_list.setItemWidget(item, row)
+        key = normalize_symbol(symbol).provider_symbol
+        self._quote_rows.setdefault(key, []).append((item, row, compact))
 
     def _open_quote_row(
         self,
@@ -2659,28 +2689,22 @@ class QuotePanel(QWidget):
 
     def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
         selected_symbol = self._current_input_symbol()
-        scroll_positions = [
-            (stock_list, stock_list.verticalScrollBar().value())
-            for stock_list in (
-                self.a_share_list,
-                self.hk_share_list,
-                self.index_list,
-                self.favorite_list,
-            )
-        ]
+        changed_keys: set[str] = set()
         names_changed = False
         for quote in quotes:
-            self._quote_cache[quote.symbol.provider_symbol] = quote
-            if quote.name and self.stock_names.get(quote.symbol.provider_symbol) != quote.name:
-                self.stock_names[quote.symbol.provider_symbol] = quote.name
+            key = quote.symbol.provider_symbol
+            if self._quote_cache.get(key) != quote:
+                changed_keys.add(key)
+            self._quote_cache[key] = quote
+            if quote.name and self.stock_names.get(key) != quote.name:
+                self.stock_names[key] = quote.name
                 names_changed = True
         if names_changed:
             self._persist_stock_names()
-        self._refresh_watchlist_lists()
-        self._select_symbol_in_current_list(selected_symbol)
-        for stock_list, position in scroll_positions:
-            scroll_bar = stock_list.verticalScrollBar()
-            scroll_bar.setValue(min(position, scroll_bar.maximum()))
+        # Update all occurrences (market/favorites/index) in place, including
+        # hidden tabs. Selection and scroll position never need to be restored.
+        self._update_quote_rows(changed_keys)
+        self._prune_quote_cache()
         self._update_market_summary()
         if selected_symbol:
             try:

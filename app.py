@@ -10,6 +10,7 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from stock_pet import __version__
+from stock_pet.diagnostics import UiStallMonitor
 from stock_pet.resources import asset_path
 from stock_pet.ui import StockPetWidget
 
@@ -33,7 +34,20 @@ def main() -> int:
         QMessageBox.information(None, "股票桌宠", "股票桌宠已经在运行。")
         return 0
 
-    pet = StockPetWidget()
+    stall_monitor = UiStallMonitor(app)
+    app.aboutToQuit.connect(stall_monitor.stop)
+    try:
+        pet = StockPetWidget()
+    except BaseException:
+        stall_monitor.stop()
+        raise
+    stall_monitor.set_context_provider(lambda: (
+        f"panel_visible={pet.panel.isVisible()} tab={pet.panel.market_tabs.currentIndex()} "
+        f"watchlist_count={len(pet.panel.watchlist)} favorites_count={len(pet.favorite_symbols)} "
+        f"skin={pet.current_skin} page_fetch={pet._watch_task is not None} "
+        f"favorite_fetch={pet._favorite_task is not None} "
+        f"detail_fetch={pet.panel._active_task is not None}"
+    ))
     app.aboutToQuit.connect(pet.close_provider)
     pet.show()
 
@@ -67,7 +81,10 @@ def main() -> int:
     tray.show()
 
     pet.quit_requested.connect(app.quit)
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        stall_monitor.stop()
 
 
 if __name__ == "__main__":
