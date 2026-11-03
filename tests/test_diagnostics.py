@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
-from stock_pet.diagnostics import UiStallMonitor
+from stock_pet.diagnostics import UiStallMonitor, trace_ui_operation
 
 
 class UiStallMonitorTests(unittest.TestCase):
@@ -24,6 +24,22 @@ class UiStallMonitorTests(unittest.TestCase):
         monitor = UiStallMonitor(log_dir=Path(directory), **options)
         self.addCleanup(monitor.stop)
         return monitor
+
+    def test_slow_render_is_buffered_then_logged_without_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = self.make_monitor(directory)
+            self.assertTrue(monitor.active, monitor.last_error)
+            @trace_ui_operation("detail_render")
+            def render(private_value):
+                return private_value
+            with patch("stock_pet.diagnostics.monotonic", side_effect=[0.0, .2]):
+                self.assertEqual(render("private quote"), "private quote")
+            self.assertNotIn("SLOW_UI", monitor.log_path.read_text(encoding="utf-8"))
+            monitor._heartbeat()
+            monitor.stop()
+            text = monitor.log_path.read_text(encoding="utf-8")
+            self.assertIn("SLOW_UI operation=detail_render duration_ms=", text)
+            self.assertNotIn("private quote", text)
 
     def test_healthy_qt_heartbeats_do_not_dump(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -96,6 +96,7 @@ class FutuQuoteProvider:
         self._ret_ok: int | None = None
         self._sub_type: Any | None = None
         self._subscribed: set[str] = set()
+        self._retired = threading.Event()
 
     def supports(self, symbol: StockSymbol) -> bool:
         return futu_code_for(symbol) is not None
@@ -179,7 +180,13 @@ class FutuQuoteProvider:
         with self._lock:
             self._reset_context()
 
+    def retire(self) -> None:
+        self._retired.set()
+        threading.Thread(target=self.close, name="opend-close", daemon=True).start()
+
     def _ensure_context(self) -> Any:
+        if self._retired.is_set():
+            raise QuoteError("行情源已切换，忽略旧 OpenD 请求")
         if self._context is not None:
             return self._context
         try:
@@ -222,59 +229,103 @@ class HybridQuoteProvider:
         self._retry_after = 0.0
         self._last_futu_error = "尚未检测 OpenD"
         self._state_lock = threading.Lock()
+        self.generation = 0
 
     def set_mode(self, mode: str) -> None:
-        self.mode = mode if mode in self.MODES else "auto"
-        if self.mode == "tencent":
-            self.futu.close()
-        else:
-            with self._state_lock:
-                self._retry_after = 0.0
+        mode = mode if mode in self.MODES else "auto"
+        retired = None
+        with self._state_lock:
+            if mode == self.mode:
+                return
+            self.mode = mode
+            self.generation += 1
+            self._retry_after = 0.0
+            if mode == "tencent":
+                retired = self.futu
+                # An old close must never close a newly re-enabled connection.
+                self.futu = FutuQuoteProvider(
+                    host=getattr(retired, "host", "127.0.0.1"),
+                    port=getattr(retired, "port", 11111),
+                )
+        if retired is not None:
+            retired.retire()
 
     def fetch(self, raw_symbol: str) -> Quote:
-        symbol = normalize_symbol(raw_symbol)
-        futu_supported = self.futu.supports(symbol)
-        if self.mode == "auto" and futu_supported and self._can_retry_futu():
-            try:
-                quote = self.futu.fetch(raw_symbol)
-            except Exception as exc:
-                self._mark_futu_failure(exc)
-            else:
-                with self._state_lock:
-                    self._last_futu_error = "OpenD 已连接，正在使用实时行情"
-                    self._retry_after = 0.0
-                return quote
-
-        quote = self.tencent.fetch(raw_symbol)
-        if self.mode == "auto" and futu_supported:
-            quote = replace(quote, source="腾讯行情（富途不可用，港股可能延迟）")
-        return quote
+        return self._fetch(raw_symbol, interactive=False)
 
     def fetch_interactive(self, raw_symbol: str) -> Quote:
         """Fetch a user-selected quote without waiting behind background batches."""
+        return self._fetch(raw_symbol, interactive=True)
+
+    def _fetch(self, raw_symbol: str, *, interactive: bool) -> Quote:
         symbol = normalize_symbol(raw_symbol)
-        futu_supported = self.futu.supports(symbol)
-        if self.mode == "auto" and futu_supported and self._can_retry_futu():
+        with self._state_lock:
+            mode, futu, generation = self.mode, self.futu, self.generation
+        futu_supported = futu.supports(symbol)
+        if mode == "auto" and futu_supported and self._can_retry_futu():
             try:
-                quote = self.futu.fetch(
-                    raw_symbol,
-                    lock_timeout=INTERACTIVE_LOCK_TIMEOUT_SECONDS,
+                quote = (
+                    futu.fetch(raw_symbol, lock_timeout=INTERACTIVE_LOCK_TIMEOUT_SECONDS)
+                    if interactive else futu.fetch(raw_symbol)
                 )
             except FutuBusyError:
                 quote = self.tencent.fetch(raw_symbol)
                 return replace(quote, source="腾讯行情（富途后台刷新中）")
             except Exception as exc:
-                self._mark_futu_failure(exc)
+                self._mark_futu_failure(exc, futu, generation)
             else:
-                with self._state_lock:
-                    self._last_futu_error = "OpenD 已连接，正在使用实时行情"
-                    self._retry_after = 0.0
+                self._record_futu_success(generation)
                 return quote
 
         quote = self.tencent.fetch(raw_symbol)
-        if self.mode == "auto" and futu_supported:
+        if mode == "auto" and futu_supported:
             quote = replace(quote, source="腾讯行情（富途不可用，港股可能延迟）")
         return quote
+
+    def fetch_batch(self, raw_symbols: list[str]) -> tuple[list[Quote], list[str]]:
+        with self._state_lock:
+            mode, futu, generation = self.mode, self.futu, self.generation
+        if mode == "tencent":
+            return self.tencent.fetch_batch(raw_symbols)
+
+        quotes: list[Quote] = []
+        errors: list[str] = []
+        fallback: list[str] = []
+        supported_keys: set[str] = set()
+        seen: set[str] = set()
+        for raw in raw_symbols:
+            if generation != self.generation:
+                break  # The UI discards this generation and retries with the new source.
+            try:
+                symbol = normalize_symbol(raw)
+            except ValueError as exc:
+                errors.append(f"{raw}: {exc}")
+                continue
+            key = symbol.provider_symbol
+            if key in seen:
+                continue
+            seen.add(key)
+            supported = futu.supports(symbol)
+            if supported:
+                supported_keys.add(key)
+            if supported and self._can_retry_futu():
+                try:
+                    quotes.append(futu.fetch(raw))
+                except Exception as exc:
+                    self._mark_futu_failure(exc, futu, generation)
+                else:
+                    self._record_futu_success(generation)
+                    continue
+            fallback.append(raw)
+        if fallback and generation == self.generation:
+            backup, failures = self.tencent.fetch_batch(fallback)
+            quotes.extend(
+                replace(q, source="腾讯行情（富途不可用，港股可能延迟）")
+                if q.symbol.provider_symbol in supported_keys else q
+                for q in backup
+            )
+            errors.extend(failures)
+        return quotes, errors
 
     def search(self, query: str, limit: int = 8) -> list[StockSearchResult]:
         return self.tencent.search(query, limit=limit)
@@ -282,11 +333,13 @@ class HybridQuoteProvider:
     def check_futu_status(self) -> tuple[bool, str]:
         with self._state_lock:
             self._retry_after = 0.0
-        ok, message = self.futu.check_status()
+            futu, generation = self.futu, self.generation
+        ok, message = futu.check_status()
         with self._state_lock:
-            self._last_futu_error = message
-            if not ok:
-                self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
+            if generation == self.generation:
+                self._last_futu_error = message
+                if not ok:
+                    self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
         return ok, message
 
     def list_futu_watchlist_groups(self) -> list[str]:
@@ -308,12 +361,19 @@ class HybridQuoteProvider:
         with self._state_lock:
             return time.monotonic() >= self._retry_after
 
-    def _mark_futu_failure(self, exc: Exception) -> None:
+    def _record_futu_success(self, generation: int) -> None:
+        with self._state_lock:
+            if generation == self.generation:
+                self._last_futu_error = "OpenD 已连接，正在使用实时行情"
+                self._retry_after = 0.0
+
+    def _mark_futu_failure(self, exc: Exception, futu: FutuQuoteProvider, generation: int) -> None:
         message = _friendly_futu_error(exc)
         with self._state_lock:
-            self._last_futu_error = message
-            self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
-        self.futu.close()
+            if generation == self.generation:
+                self._last_futu_error = message
+                self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
+        futu.close()
 
 
 def _row_value(row: Any, key: str, default: Any = None) -> Any:

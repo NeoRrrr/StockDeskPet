@@ -7,6 +7,8 @@ It is process-global; the application owns exactly one UiStallMonitor.
 from __future__ import annotations
 
 import faulthandler
+from collections import deque
+from functools import wraps
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -24,6 +26,27 @@ STALL_SECONDS = 3.0
 HEARTBEAT_MS = 1000
 MAX_LOG_BYTES = 2 * 1024 * 1024
 LOG_BACKUPS = 2
+SLOW_UI_SECONDS = 0.1
+_active_monitor: UiStallMonitor | None = None
+
+
+def trace_ui_operation(name: str):
+    """Record slow GUI work without file I/O in the rendering hot path."""
+    def decorate(function):
+        @wraps(function)
+        def measured(*args, **kwargs):
+            monitor = _active_monitor
+            if monitor is None or not monitor.active:
+                return function(*args, **kwargs)
+            start = monotonic()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                elapsed = monotonic() - start
+                if elapsed >= SLOW_UI_SECONDS:
+                    monitor._slow_operations.append((name, elapsed))
+        return measured
+    return decorate
 
 
 def diagnostic_log_dir() -> Path:
@@ -48,6 +71,7 @@ class UiStallMonitor(QObject):
         heartbeat_ms: int = HEARTBEAT_MS,
         max_bytes: int = MAX_LOG_BYTES,
     ) -> None:
+        global _active_monitor
         super().__init__(parent)
         if threshold_seconds <= heartbeat_ms / 1000:
             raise ValueError("Stall threshold must exceed the heartbeat interval")
@@ -60,6 +84,7 @@ class UiStallMonitor(QObject):
         self._last_context = "initializing"
         self._last_heartbeat = monotonic()
         self._armed = False
+        self._slow_operations: deque[tuple[str, float]] = deque(maxlen=32)
         self._timer = QTimer(self)
         self._timer.setInterval(heartbeat_ms)
         self._timer.timeout.connect(self._heartbeat)
@@ -80,6 +105,7 @@ class UiStallMonitor(QObject):
             )
             self._arm()
             self._timer.start()
+            _active_monitor = self
         except Exception as exc:
             self._disable(exc)
 
@@ -113,6 +139,9 @@ class UiStallMonitor(QObject):
         if self._handler is None:
             return
         try:
+            while self._slow_operations:
+                operation, duration = self._slow_operations.popleft()
+                self._logger.warning("SLOW_UI operation=%s duration_ms=%.1f", operation, duration * 1000)
             if elapsed >= self.threshold_seconds:
                 self._logger.warning(
                     "UI_STALL_RECOVERED heartbeat_gap=%.3fs previous_context=%s "
@@ -140,6 +169,9 @@ class UiStallMonitor(QObject):
         self.stop()
 
     def stop(self) -> None:
+        global _active_monitor
+        if _active_monitor is self:
+            _active_monitor = None
         self._timer.stop()
         self._cancel()
         if self._handler is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,3 +53,23 @@ class Quote:
 class StockSearchResult:
     symbol: StockSymbol
     name: str
+
+
+def quote_is_older(incoming: Quote, current: Quote | None) -> bool:
+    """Do not let a late/undated response replace a newer market snapshot."""
+    if current is None:
+        return False
+
+    def timestamp(quote: Quote) -> datetime | None:
+        try:
+            value = datetime.fromisoformat(quote.quote_time.replace("/", "-"))
+            return value if value.tzinfo else value.replace(tzinfo=timezone(timedelta(hours=8)))
+        except ValueError:
+            return None
+
+    old_time, new_time = timestamp(current), timestamp(incoming)
+    if old_time is None:
+        return False
+    if new_time is None:
+        return True
+    return new_time < old_time

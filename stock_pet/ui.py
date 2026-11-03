@@ -39,8 +39,9 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .animated_skin import AnimatedSkin, DSH_CANVAS_WIDTH, DSH_SKIN_KEY, ONE_SHOT_STATES
 from .expression_skin import EXPRESSION_SKIN_KEY, ExpressionSkin
+from .diagnostics import trace_ui_operation
 from .hybrid_quote_provider import HybridQuoteProvider
-from .models import Quote, StockSearchResult
+from .models import Quote, StockSearchResult, quote_is_older
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
 from .symbols import (
@@ -120,6 +121,11 @@ A_SHARE_SESSIONS = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
 HK_SESSIONS = ((9 * 60 + 30, 12 * 60), (13 * 60, 16 * 60))
 
 _UI_FONTS_LOADED = False
+
+
+def _set_text_if_changed(widget: QLabel | QLineEdit, text: str) -> None:
+    if widget.text() != text:
+        widget.setText(text)
 
 
 def _is_open_for_automatic_refresh(
@@ -284,12 +290,18 @@ class FetchSignals(QObject):
     failed = Signal(str)
 
 
+class DetailFetchSignals(QObject):
+    finished = Signal(object, object)
+    failed = Signal(object, str)
+
+
 class FetchTask(QRunnable):
     def __init__(self, provider: TencentQuoteProvider, symbol: str) -> None:
         super().__init__()
         self.provider = provider
         self.symbol = symbol
-        self.signals = FetchSignals()
+        self.generation = getattr(provider, "generation", 0)
+        self.signals = DetailFetchSignals()
 
     @Slot()
     def run(self) -> None:
@@ -301,9 +313,9 @@ class FetchTask(QRunnable):
                 else self.provider.fetch(self.symbol)
             )
         except Exception as exc:
-            self.signals.failed.emit(str(exc))
+            self.signals.failed.emit(self, str(exc))
             return
-        self.signals.finished.emit(quote)
+        self.signals.finished.emit(self, quote)
 
 
 class WatchlistTask(QRunnable):
@@ -311,10 +323,19 @@ class WatchlistTask(QRunnable):
         super().__init__()
         self.provider = provider
         self.symbols = symbols
+        self.generation = getattr(provider, "generation", 0)
         self.signals = FetchSignals()
 
     @Slot()
     def run(self) -> None:
+        fetch_batch = getattr(self.provider, "fetch_batch", None)
+        if callable(fetch_batch):
+            try:
+                result = fetch_batch(self.symbols)
+            except Exception as exc:
+                result = ([], [str(exc)])
+            self.signals.finished.emit(result)
+            return
         quotes: list[Quote] = []
         errors: list[str] = []
         for symbol in self.symbols:
@@ -1731,6 +1752,7 @@ class SettingsDialog(QDialog):
 
 class QuotePanel(QWidget):
     quote_loaded = Signal(object)
+    quotes_updated = Signal(object)
     loading_changed = Signal(bool)
     watchlist_changed = Signal(object, float, int, bool)
     favorites_changed = Signal(object)
@@ -2235,7 +2257,7 @@ class QuotePanel(QWidget):
         symbol = normalize_symbol(raw_symbol)
         self._resolved_input_symbol = symbol.code
         parts = [name.strip(), symbol.display_code, symbol.market_label]
-        self.symbol_input.setText(" · ".join(part for part in parts if part))
+        _set_text_if_changed(self.symbol_input, " · ".join(part for part in parts if part))
 
     @Slot(str)
     def _on_search_text_changed(self, text: str) -> None:
@@ -2351,6 +2373,7 @@ class QuotePanel(QWidget):
         if symbol:
             self.fetch_symbol(str(symbol))
 
+    @trace_ui_operation("market_tab_changed")
     def _on_market_tab_changed(self, index: int) -> None:
         self._update_market_summary()
         self._select_first_current_tab_item()
@@ -2483,7 +2506,7 @@ class QuotePanel(QWidget):
                 color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
                 price_text = f"{_currency_prefix(quote.symbol.currency)}{_price(quote.price)}"
                 change_text = f"{arrow}{quote.change_percent:+.2f}%"
-            cell.setText(
+            _set_text_if_changed(cell,
                 f'<span style="color:{label_color}">{label}</span><br>'
                 f'<span style="color:{color};font-weight:600">{price_text}</span> '
                 f'<span style="color:{color}">{change_text}</span>'
@@ -2688,12 +2711,17 @@ class QuotePanel(QWidget):
         self.status_label.setText(message)
         self.favorites_changed.emit(list(self.favorite_symbols))
 
-    def update_watchlist_quotes(self, quotes: list[Quote]) -> None:
+    @trace_ui_operation("quote_list_update")
+    def update_watchlist_quotes(self, quotes: list[Quote]) -> list[Quote]:
         selected_symbol = self._current_input_symbol()
         changed_keys: set[str] = set()
         names_changed = False
+        accepted: list[Quote] = []
         for quote in quotes:
             key = quote.symbol.provider_symbol
+            if quote_is_older(quote, self._quote_cache.get(key)):
+                continue
+            accepted.append(quote)
             if self._quote_cache.get(key) != quote:
                 changed_keys.add(key)
             self._quote_cache[key] = quote
@@ -2705,6 +2733,10 @@ class QuotePanel(QWidget):
         # Update all occurrences (market/favorites/index) in place, including
         # hidden tabs. Selection and scroll position never need to be restored.
         self._update_quote_rows(changed_keys)
+        if accepted:
+            self.quotes_updated.emit([
+                self._quote_cache[key] for key in dict.fromkeys(q.symbol.provider_symbol for q in accepted)
+            ])
         self._prune_quote_cache()
         self._update_market_summary()
         if selected_symbol:
@@ -2715,6 +2747,7 @@ class QuotePanel(QWidget):
             selected_quote = self._quote_cache.get(selected_key)
             if selected_quote is not None:
                 self._display_quote(selected_quote)
+        return accepted
 
     @Slot()
     def save_current_symbol(self) -> None:
@@ -2845,6 +2878,8 @@ class QuotePanel(QWidget):
         cached_quote = self._quote_cache.get(symbol_key)
         if cached_quote is not None:
             self._display_quote(cached_quote)
+        else:
+            self._show_pending_quote(symbol)
 
         if self._active_task is not None:
             self._pending_fetch_symbol = symbol
@@ -2866,35 +2901,46 @@ class QuotePanel(QWidget):
         self.loading_changed.emit(True)
 
         task = FetchTask(self.provider, symbol)
-        task.signals.finished.connect(
-            lambda quote, active_task=task: self._on_quote(active_task, quote)
-        )
-        task.signals.failed.connect(
-            lambda message, active_task=task: self._on_fetch_error(active_task, message)
-        )
+        # Bound QObject slots avoid a native connection -> lambda -> task ->
+        # signals reference cycle that retained every completed detail request.
+        task.signals.finished.connect(self._on_quote)
+        task.signals.failed.connect(self._on_fetch_error)
         self._active_task = task
         self.thread_pool.start(task)
 
+    @Slot(object, object)
     def _on_quote(self, task: FetchTask, quote: Quote) -> None:
         if task is not self._active_task:
             return
         self._active_task = None
+        if task.generation != getattr(self.provider, "generation", 0):
+            self._retry_current_detail()
+            return
         self.update_watchlist_quotes([quote])
         self._continue_pending_fetch(task.symbol)
 
+    @Slot(object, str)
     def _on_fetch_error(self, task: FetchTask, message: str) -> None:
         if task is not self._active_task:
             return
         self._active_task = None
+        if task.generation != getattr(self.provider, "generation", 0):
+            self._retry_current_detail()
+            return
         pending = self._pending_fetch_symbol
         if pending:
             self._continue_pending_fetch(task.symbol)
-            return
+            if self._active_task is not None:
+                return
 
         try:
             key = normalize_symbol(task.symbol).provider_symbol
+            current_key = normalize_symbol(self._current_input_symbol()).provider_symbol
         except SymbolError:
-            key = ""
+            key, current_key = "", ""
+        if not key or key != current_key:
+            self.loading_changed.emit(False)
+            return
         if key and key in self._quote_cache:
             self.status_label.setText(f"最新行情更新失败，继续显示最近数据\n{message}")
             self.loading_changed.emit(False)
@@ -2908,40 +2954,65 @@ class QuotePanel(QWidget):
             try:
                 pending_key = normalize_symbol(pending).provider_symbol
                 completed_key = normalize_symbol(completed_symbol).provider_symbol
+                if pending_key != normalize_symbol(self._current_input_symbol()).provider_symbol:
+                    self.loading_changed.emit(False)
+                    return
             except SymbolError:
-                pending_key = pending
-                completed_key = completed_symbol
+                self.loading_changed.emit(False)
+                return
             if pending_key != completed_key:
                 cached = self._quote_cache.get(pending_key)
                 self._start_quote_fetch(pending, cached is not None)
                 return
         self.loading_changed.emit(False)
 
+    def _retry_current_detail(self) -> None:
+        self._pending_fetch_symbol = None
+        self.loading_changed.emit(False)
+        try:
+            normalize_symbol(self._current_input_symbol())
+        except SymbolError:
+            return
+        self.fetch_quote()
+
+    def _show_pending_quote(self, raw_symbol: str) -> None:
+        symbol = normalize_symbol(raw_symbol)
+        name = self.stock_names.get(symbol.provider_symbol, symbol.display_code)
+        self.name_label.setText(f"{name} · 等待行情")
+        self.price_label.setText("--")
+        self.change_label.clear()
+        self.price_label.setStyleSheet("")
+        self.change_label.setStyleSheet("")
+        self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
+
+    @trace_ui_operation("detail_render")
     def _display_quote(self, quote: Quote) -> None:
         self._set_symbol_input_display(quote.symbol.code, quote.name)
         currency = _currency_prefix(quote.symbol.currency)
         color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
 
-        self.name_label.setText(f"{quote.name}  ·  {quote.symbol.display_code}  ·  {quote.symbol.market_label}")
-        self.price_label.setText(f"{currency}{_price(quote.price)}")
-        self.change_label.setText(f"{arrow} {quote.change_percent:+.2f}%")
-        self.price_label.setStyleSheet(f"color: {color};")
-        self.change_label.setStyleSheet(f"color: {color};")
+        _set_text_if_changed(self.name_label, f"{quote.name}  ·  {quote.symbol.display_code}  ·  {quote.symbol.market_label}")
+        _set_text_if_changed(self.price_label, f"{currency}{_price(quote.price)}")
+        _set_text_if_changed(self.change_label, f"{arrow} {quote.change_percent:+.2f}%")
+        for label in (self.price_label, self.change_label):
+            style = f"color: {color};"
+            if label.styleSheet() != style:
+                label.setStyleSheet(style)
         if quote.symbol.market in {"hk_index", "cn_index", "gold"}:
             unit = "美元/盎司" if quote.symbol.market == "gold" else "指数点"
-            self.details_label.setText(
+            _set_text_if_changed(self.details_label,
                 f"今开 {_price(quote.open_price)}    最高 {_price(quote.high)}    最低 {_price(quote.low)}\n"
                 f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}    单位 {unit}"
             )
         else:
             turnover = "--" if quote.turnover_rate is None else f"{quote.turnover_rate:.2f}%"
-            self.details_label.setText(
+            _set_text_if_changed(self.details_label,
                 f"今开 {_price(quote.open_price)}    最高 {_price(quote.high)}    最低 {_price(quote.low)}\n"
                 f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}\n"
                 f"成交额 {_human_money(quote.amount)}    换手 {turnover}"
             )
-        self.status_label.setText(f"{quote.source} · {quote.quote_time}\n行情可能延迟，仅供参考，不作为交易依据")
+        _set_text_if_changed(self.status_label, f"{quote.source} · {quote.quote_time}\n行情可能延迟，仅供参考，不作为交易依据")
         self.quote_loaded.emit(quote)
 
     @Slot(str)
@@ -2970,6 +3041,7 @@ class QuotePanel(QWidget):
         y = max(available.top(), min(y, available.bottom() - self.height() + 1))
         self.move(x, y)
 
+    @trace_ui_operation("quote_panel_show")
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self._open_tab_refresh_timer.start()
@@ -2993,6 +3065,7 @@ class StockPetWidget(QWidget):
         self.provider = HybridQuoteProvider(mode=quote_source)
         self.panel = QuotePanel(self.provider, self.settings)
         self.panel.quote_loaded.connect(self._apply_quote)
+        self.panel.quotes_updated.connect(self._sync_favorite_quotes)
         self.panel.loading_changed.connect(self._loading_changed)
         self.panel.watchlist_changed.connect(self._apply_watchlist_config)
         self.panel.favorites_changed.connect(self._apply_favorites)
@@ -3461,7 +3534,7 @@ class StockPetWidget(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         self._resize_for_bubble(len(quotes))
-        self.bubble.setText("".join(lines))
+        _set_text_if_changed(self.bubble, "".join(lines))
         self._apply_bubble_theme(self.panel.current_theme)
 
     @Slot()
@@ -3594,10 +3667,34 @@ class StockPetWidget(QWidget):
         QThreadPool.globalInstance().start(task)
 
     @Slot(object)
+    def _sync_favorite_quotes(self, quotes: list[Quote]) -> None:
+        latest = {quote.symbol.provider_symbol: quote for quote in self._favorite_quotes}
+        for quote in quotes:
+            key = quote.symbol.provider_symbol
+            if not quote_is_older(quote, latest.get(key)):
+                latest[key] = quote
+        updated = [
+            latest[key] for code in self.favorite_symbols
+            if (key := normalize_symbol(code).provider_symbol) in latest
+        ]
+        if updated == self._favorite_quotes:
+            return
+        self._favorite_quotes = updated
+        if self._bubble_showing_favorites and self._can_show_favorite_bubble():
+            count = self._favorite_page_count()
+            if count:
+                self._render_favorite_page((self._favorite_index - 1) % count)
+
+    @Slot(object)
     def _on_favorite_result(self, result: tuple[list[Quote], list[str]]) -> None:
         quotes, errors = result
+        stale_source = self._favorite_task is not None and self._favorite_task.generation != self.provider.generation
         requested_symbols = self._favorite_task.symbols if self._favorite_task else []
         self._favorite_task = None
+        if stale_source:
+            self._favorite_refresh_pending = False
+            QTimer.singleShot(0, self.refresh_favorites)
+            return
         favorite_keys = {
             normalize_symbol(code).provider_symbol for code in self.favorite_symbols
         }
@@ -3612,23 +3709,6 @@ class StockPetWidget(QWidget):
             self._favorite_initial_retries,
         )
         if refreshed_quotes:
-            previous_by_key = {
-                quote.symbol.provider_symbol: quote for quote in self._favorite_quotes
-            }
-            refreshed_by_key = {
-                quote.symbol.provider_symbol: quote for quote in refreshed_quotes
-            }
-            self._favorite_quotes = [
-                quote
-                for code in self.favorite_symbols
-                if (
-                    quote := refreshed_by_key.get(
-                        normalize_symbol(code).provider_symbol,
-                        previous_by_key.get(normalize_symbol(code).provider_symbol),
-                    )
-                )
-                is not None
-            ]
             self.panel.update_watchlist_quotes(refreshed_quotes)
 
         # Async results must respect settings/favorites/market time at completion.
@@ -3688,10 +3768,12 @@ class StockPetWidget(QWidget):
             9,
             (11 * self.favorite_bubble_font_percent + 50) // 100,
         )
-        self.bubble.setStyleSheet(
+        style = (
             f"color: {foreground}; background: {background}; border: 1px solid {border};"
             f"border-radius: 13px; font: 700 {font_pixels}px 'Noto Sans SC'; padding: 2px;"
         )
+        if self.bubble.styleSheet() != style:
+            self.bubble.setStyleSheet(style)
 
     @Slot(str)
     def _on_bubble_theme_changed(self, theme: str) -> None:
@@ -3845,6 +3927,7 @@ class StockPetWidget(QWidget):
     @Slot(object)
     def _on_watchlist_result(self, result: tuple[list[Quote], list[str]]) -> None:
         quotes, errors = result
+        stale_source = self._watch_task is not None and self._watch_task.generation != self.provider.generation
         manual = self._watch_manual
         animate = self._watch_animate
         requested_symbols = self._watch_task.symbols if self._watch_task else []
@@ -3853,11 +3936,20 @@ class StockPetWidget(QWidget):
         self._watch_animate = False
         if animate:
             self._set_refresh_activity("page", False)
+        if stale_source:
+            # Do not mix old-source responses into caches or alert state.
+            if self._pending_page_symbols:
+                symbols = self._pending_page_symbols
+                self._pending_page_symbols = None
+                QTimer.singleShot(0, lambda: self.refresh_market_page(symbols))
+            else:
+                QTimer.singleShot(0, lambda: self.refresh_market_page_silent(requested_symbols))
+            return
         self._record_initial_refresh_result(
             requested_symbols, quotes, self._page_refresh_initialized_keys,
             self._page_initial_retries,
         )
-        self.panel.update_watchlist_quotes(quotes)
+        quotes = self.panel.update_watchlist_quotes(quotes)
 
         if manual:
             message = f"当前页刷新完成：成功 {len(quotes)} 项"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
@@ -47,16 +48,28 @@ class TencentQuoteProvider:
 
     def fetch_many(self, raw_symbols: list[str]) -> list[Quote]:
         """Fetch several quotes in one request, returning any rows that parse."""
+        quotes, errors = self.fetch_batch(raw_symbols)
+        if not quotes and errors:
+            raise QuoteError(errors[0])
+        return quotes
+
+    def fetch_batch(self, raw_symbols: list[str]) -> tuple[list[Quote], list[str]]:
+        """Keep successful chunks even when another chunk/row is unavailable."""
         symbols: list[StockSymbol] = []
         seen: set[str] = set()
+        errors: list[str] = []
         for raw_symbol in raw_symbols:
-            symbol = normalize_symbol(raw_symbol)
+            try:
+                symbol = normalize_symbol(raw_symbol)
+            except SymbolError as exc:
+                errors.append(f"{raw_symbol}: {exc}")
+                continue
             if symbol.provider_symbol in seen:
                 continue
             seen.add(symbol.provider_symbol)
             symbols.append(symbol)
         if not symbols:
-            return []
+            return [], errors
 
         quotes: list[Quote] = []
         for start in range(0, len(symbols), 50):
@@ -67,7 +80,8 @@ class TencentQuoteProvider:
             try:
                 payload = self._transport(url).decode("gb18030", errors="replace")
             except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                raise QuoteError(f"行情网络请求失败：{exc}") from exc
+                errors.extend(f"{symbol.code}: 行情网络请求失败：{exc}" for symbol in chunk)
+                continue
             rows = {
                 key.lower(): value
                 for key, value in re.findall(r'v_([^=\s]+)\s*=\s*"([^"]*)"', payload)
@@ -75,12 +89,13 @@ class TencentQuoteProvider:
             for symbol in chunk:
                 value = rows.get(symbol.provider_symbol.lower())
                 if not value:
+                    errors.append(f"{symbol.code}: 没有返回行情")
                     continue
                 try:
                     quotes.append(parse_tencent_payload(f'="{value}"', symbol))
-                except QuoteError:
-                    continue
-        return quotes
+                except QuoteError as exc:
+                    errors.append(f"{symbol.code}: {exc}")
+        return quotes, errors
 
     def search(self, query: str, limit: int = 8) -> list[StockSearchResult]:
         keyword = (query or "").strip()
@@ -175,6 +190,14 @@ def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
         volume_unit = "手"
         amount = _number(fields, 57, _number(fields, 37)) * 10_000.0
         turnover_rate = _optional_number(fields, 38)
+
+    # Currency belongs to the quote, not just its listing exchange: e.g. 81810
+    # is Xiaomi's RMB counter. Index quotes retain their points unit.
+    currency_index = 75 if symbol.market == "hk" else 82
+    if symbol.market in {"hk", "sh", "sz", "bj"} and len(fields) > currency_index:
+        currency = fields[currency_index].strip().upper()
+        if currency in {"CNY", "HKD", "USD"}:
+            symbol = replace(symbol, currency=currency)
 
     return Quote(
         symbol=symbol,
