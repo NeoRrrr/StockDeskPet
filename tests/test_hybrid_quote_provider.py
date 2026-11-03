@@ -110,6 +110,7 @@ class HybridQuoteProviderTests(unittest.TestCase):
             mode="auto",
             tencent=TencentFallback(),  # type: ignore[arg-type]
             futu=OfflineFutu(),  # type: ignore[arg-type]
+            opend_probe=lambda _host, _port: True,
         )
         result = provider.fetch("01810")
 
@@ -161,6 +162,7 @@ class HybridQuoteProviderTests(unittest.TestCase):
             mode="auto",
             tencent=TencentFallback(),  # type: ignore[arg-type]
             futu=futu,  # type: ignore[arg-type]
+            opend_probe=lambda _host, _port: True,
         )
 
         result = provider.fetch_interactive("01810")

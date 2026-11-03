@@ -79,7 +79,7 @@ class BatchRefreshTests(unittest.TestCase):
         self.assertEqual(len(errors), 3)
 
     def test_opend_failure_falls_back_in_one_batch(self):
-        provider = HybridQuoteProvider()
+        provider = HybridQuoteProvider(opend_probe=lambda _host, _port: True)
         expected = [quote("01810"), quote("00700"), quote("GOLD")]
         with patch.object(provider.futu, "fetch", side_effect=QuoteError("offline")) as futu_fetch, \
              patch.object(provider.futu, "close"), \
