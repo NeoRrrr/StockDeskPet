@@ -29,7 +29,7 @@ class HybridQuoteProviderTests(unittest.TestCase):
 
         self.assertEqual(
             watchlist_entries_from_futu_data(Rows()),
-            [("00700", "腾讯控股"), ("159516", "半导体设备ETF")],
+            [("00700", "腾讯控股"), ("159516", "半导体设备ETF"), ("US.AAPL", "Apple")],
         )
 
     def test_futu_code_mapping_uses_official_market_prefixes(self) -> None:

@@ -41,7 +41,7 @@ from .animated_skin import AnimatedSkin, DSH_CANVAS_WIDTH, DSH_SKIN_KEY, ONE_SHO
 from .expression_skin import EXPRESSION_SKIN_KEY, ExpressionSkin
 from .diagnostics import trace_ui_operation
 from .hybrid_quote_provider import HybridQuoteProvider
-from .models import Quote, StockSearchResult, quote_is_older
+from .models import Quote, StockSearchResult, US_TIMEZONE, quote_is_older, quote_session_label, us_quote_is_current
 from .quote_provider import TencentQuoteProvider
 from .resources import asset_path
 from .symbols import (
@@ -56,6 +56,7 @@ from .update_checker import (
     AutomaticUpdateResult,
     check_download_and_install,
 )
+from .us_sessions import us_session_at
 
 
 SPRITE_CELL_WIDTH = 192
@@ -85,17 +86,30 @@ SKINS: dict[str, tuple[str, str, bool]] = {
 }
 DEFAULT_HK_WATCHLIST = ("00700", "01810")
 DEFAULT_A_SHARE_ETFS = ("159516", "515880", "512200", "512800")
-DEFAULT_WATCHLIST = (*DEFAULT_A_SHARE_ETFS, *DEFAULT_HK_WATCHLIST)
+DEFAULT_US_STOCK_NAMES = {
+    "US.NVDA": "英伟达",
+    "US.SPCX": "SpaceX",
+    "US.MU": "美光科技",
+    "US.TSLA": "特斯拉",
+    "US.SNDK": "闪迪",
+}
+DEFAULT_US_WATCHLIST = tuple(DEFAULT_US_STOCK_NAMES)
+US_DEFAULTS_SETTINGS_KEY = "us_watchlist_defaults_v1_added"
+DEFAULT_WATCHLIST = (*DEFAULT_A_SHARE_ETFS, *DEFAULT_HK_WATCHLIST, *DEFAULT_US_WATCHLIST)
 INDEX_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("港股指数", ("HSI", "HSTECH", "HSCEI")),
     ("大A指数", ("SHCOMP", "CSI300", "SZCOMP", "CHINEXT")),
+    ("美股指数", ("DJI", "IXIC", "SPX")),
     ("黄金", ("GOLD",)),
 )
 INDEX_SYMBOLS = tuple(symbol for _group, symbols in INDEX_GROUPS for symbol in symbols)
 TAB_MARKET_SUMMARIES: dict[int, tuple[tuple[str, str], ...]] = {
     0: (("沪指", "SHCOMP"), ("深指", "SZCOMP"), ("创业板", "CHINEXT")),
     1: (("恒生", "HSI"), ("恒科", "HSTECH")),
+    2: (("道指", "DJI"), ("纳指", "IXIC"), ("标普500", "SPX")),
 }
+INDEX_TAB = 3
+FAVORITE_TAB = 4
 FAVORITE_REFRESH_INTERVAL_MS = 5_000
 OPEN_TAB_REFRESH_INTERVAL_MS = 10_000
 FAVORITE_BUBBLE_PAGE_INTERVAL_MS = 10_000
@@ -119,6 +133,7 @@ A_SHARE_MARKETS = {"sh", "sz", "bj", "cn_index"}
 HK_MARKETS = {"hk", "hk_index"}
 A_SHARE_SESSIONS = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
 HK_SESSIONS = ((9 * 60 + 30, 12 * 60), (13 * 60, 16 * 60))
+US_MARKETS = {"us", "us_index"}
 
 _UI_FONTS_LOADED = False
 
@@ -132,7 +147,7 @@ def _is_open_for_automatic_refresh(
     raw_symbol: str,
     at: datetime | None = None,
 ) -> bool:
-    """Return whether a symbol should be polled automatically in China time."""
+    """Use the listing market's weekday/session; naive inputs are China time."""
     try:
         market = normalize_symbol(raw_symbol).market
     except SymbolError:
@@ -141,8 +156,16 @@ def _is_open_for_automatic_refresh(
     current = at or datetime.now(MARKET_TIMEZONE)
     if current.tzinfo is None:
         current = current.replace(tzinfo=MARKET_TIMEZONE)
-    else:
-        current = current.astimezone(MARKET_TIMEZONE)
+    if market in US_MARKETS:
+        if market == "us":
+            return us_session_at(current, close_grace=True) is not None
+        current = current.astimezone(US_TIMEZONE)
+        minute = current.hour * 60 + current.minute
+        return (
+            current.weekday() < 5
+            and 9 * 60 + 30 <= minute < 16 * 60 + MARKET_CLOSE_REFRESH_GRACE_MINUTES
+        )
+    current = current.astimezone(MARKET_TIMEZONE)
 
     if current.weekday() >= 5:
         return market not in A_SHARE_MARKETS | HK_MARKETS | {"gold"}
@@ -189,6 +212,9 @@ def _is_visible_in_idle_bubble(
         market = normalize_symbol(raw_symbol).market
     except SymbolError:
         return False
+
+    if market in US_MARKETS:
+        return _is_open_for_automatic_refresh(raw_symbol, at)
 
     current = at or datetime.now(MARKET_TIMEZONE)
     if current.tzinfo is None:
@@ -247,6 +273,24 @@ def _settings_list(settings: QSettings, key: str) -> list[str]:
     return []
 
 
+def _merge_default_us_watchlist(
+    watchlist: list[str], catalog: list[str],
+) -> tuple[list[str], list[str]]:
+    """Append missing defaults without evicting stocks or re-enabling hidden ones.
+
+    Inputs are already normalized; the catalog includes all displayed stocks.
+    """
+    watchlist, catalog = list(watchlist), list(catalog)
+    for code in DEFAULT_US_WATCHLIST:
+        if code in catalog:
+            continue
+        if len(catalog) >= MAX_WATCHLIST_ITEMS:
+            break
+        catalog.append(code)
+        watchlist.append(code)
+    return watchlist, catalog
+
+
 def _normalize_stock_names(value: object) -> dict[str, str]:
     if isinstance(value, str):
         try:
@@ -264,7 +308,7 @@ def _normalize_stock_names(value: object) -> dict[str, str]:
             symbol = normalize_symbol(str(raw_symbol))
         except SymbolError:
             continue
-        if symbol.market in {"hk", "sh", "sz", "bj"}:
+        if symbol.market in {"hk", "sh", "sz", "bj", "us"}:
             names[symbol.provider_symbol] = name
     return names
 
@@ -593,7 +637,7 @@ class QuoteRowWidget(QWidget):
 
 
 class EqualWidthTabWidget(QTabWidget):
-    """Keep the three market tabs aligned to the full list width."""
+    """Keep all market tabs aligned to the full list width."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -689,7 +733,7 @@ class FutuWatchlistImportDialog(QDialog):
         title = QLabel("从富途导入自选")
         title.setObjectName("importTitle")
         help_label = QLabel(
-            "只读取同一 OpenD 账号的自选，仅导入大A和港股，"
+            "只读取同一 OpenD 账号的自选，导入大A、港股和美股，"
             "不会修改富途手机端。"
         )
         help_label.setObjectName("importHelp")
@@ -836,7 +880,7 @@ class FutuWatchlistImportDialog(QDialog):
             self.stock_list.addItem(item)
         self._updating_items = False
         if self.stock_list.count() == 0:
-            self.status_label.setText("该分组没有桌宠支持的大A或港股。")
+            self.status_label.setText("该分组没有桌宠支持的大A、港股或美股。")
             self.import_button.setEnabled(False)
             self.one_click_button.setEnabled(False)
         else:
@@ -1795,9 +1839,17 @@ class QuotePanel(QWidget):
             )
         except SymbolError:
             self.watchlist_catalog = list(self.watchlist)
+        if settings.value(US_DEFAULTS_SETTINGS_KEY) is None:
+            self.watchlist, self.watchlist_catalog = _merge_default_us_watchlist(
+                self.watchlist, self.watchlist_catalog,
+            )
+            settings.setValue(US_DEFAULTS_SETTINGS_KEY, True)
         self.stock_names = _normalize_stock_names(
             settings.value(STOCK_NAME_CACHE_SETTINGS_KEY, "{}")
         )
+        for code, name in DEFAULT_US_STOCK_NAMES.items():
+            if code in self.watchlist_catalog:
+                self.stock_names.setdefault(normalize_symbol(code).provider_symbol, name)
         settings.setValue("watchlist", self.watchlist)
         settings.setValue("watchlist_catalog", self.watchlist_catalog)
         settings.setValue(
@@ -1860,7 +1912,7 @@ class QuotePanel(QWidget):
         search = QHBoxLayout()
         self.symbol_input = QLineEdit()
         self.symbol_input.setText(last_symbol)
-        self.symbol_input.setPlaceholderText("代码或名称：01810 / 小米 / HSI")
+        self.symbol_input.setPlaceholderText("代码或名称：小米 / NVDA / 英伟达 / SPX")
         self.symbol_input.setClearButtonEnabled(True)
         self._search_model = QStringListModel(self)
         self.search_completer = QCompleter(self._search_model, self)
@@ -1914,11 +1966,13 @@ class QuotePanel(QWidget):
         self.market_tabs.setFixedHeight(235)
         self.a_share_list = QListWidget()
         self.hk_share_list = QListWidget()
+        self.us_share_list = QListWidget()
         self.favorite_list = QListWidget()
         self.index_list = QListWidget()
         for stock_list in (
             self.a_share_list,
             self.hk_share_list,
+            self.us_share_list,
             self.favorite_list,
             self.index_list,
         ):
@@ -1930,6 +1984,7 @@ class QuotePanel(QWidget):
         self.index_list.setObjectName("indexList")
         self.market_tabs.addTab(self.a_share_list, "大A")
         self.market_tabs.addTab(self.hk_share_list, "港股")
+        self.market_tabs.addTab(self.us_share_list, "美股")
         self.market_tabs.addTab(self.index_list, "指数")
         self.market_tabs.addTab(self.favorite_list, "收藏")
         layout.addWidget(self.market_tabs)
@@ -2029,7 +2084,7 @@ class QuotePanel(QWidget):
             QTabBar::tab {
                 color: #9aaabd; background: #0e1824; border: 1px solid #364a63;
                 border-right: none; margin: 0;
-                padding: 7px 12px; min-width: 60px;
+                padding: 7px 4px; min-width: 40px;
                 font: 600 12px "Noto Sans SC";
             }
             QTabBar::tab:first { border-top-left-radius: 8px; }
@@ -2223,7 +2278,7 @@ class QuotePanel(QWidget):
             item = self.index_list.item(index)
             if not item.data(Qt.ItemDataRole.UserRole):
                 item.setForeground(QColor("#64758a" if theme == "beige" else "#8799af"))
-        for stock_list in (self.a_share_list, self.hk_share_list, self.favorite_list):
+        for stock_list in (self.a_share_list, self.hk_share_list, self.us_share_list, self.favorite_list):
             for index in range(stock_list.count()):
                 item = stock_list.item(index)
                 if not item.data(Qt.ItemDataRole.UserRole):
@@ -2239,7 +2294,9 @@ class QuotePanel(QWidget):
 
     @staticmethod
     def _extract_symbol_from_text(text: str) -> str | None:
-        candidates = [text, *(part.strip() for part in text.split("·"))]
+        parts = [part.strip() for part in text.split("·")]
+        # In a formatted result, the name may itself look like a US ticker.
+        candidates = [*parts[1:], text, parts[0]] if len(parts) > 1 else [text]
         for candidate in candidates:
             try:
                 return normalize_symbol(candidate).code
@@ -2279,12 +2336,15 @@ class QuotePanel(QWidget):
             self.search_completer.popup().hide()
             return
         try:
-            normalize_symbol(keyword)
+            symbol = normalize_symbol(keyword)
         except SymbolError:
             self._search_timer.start()
         else:
-            self._search_timer.stop()
-            self.search_completer.popup().hide()
+            if symbol.market == "us":
+                self._search_timer.start()
+            else:
+                self._search_timer.stop()
+                self.search_completer.popup().hide()
 
     @Slot()
     def _search_by_name(self) -> None:
@@ -2329,7 +2389,7 @@ class QuotePanel(QWidget):
                 self.search_completer.complete()
             else:
                 self.search_completer.popup().hide()
-                self.status_label.setText(error or f"没有找到“{keyword}”对应的大A或港股")
+                self.status_label.setText(error or f"没有找到“{keyword}”对应的大A、港股或美股")
 
         pending = self._pending_search_text
         self._pending_search_text = ""
@@ -2384,12 +2444,13 @@ class QuotePanel(QWidget):
             self.status_label.setText("当前市场已休市，显示最近一次行情")
 
     def _current_tab_list_symbols(self) -> list[str]:
-        a_shares, hk_shares = partition_watchlist(self.watchlist)
+        a_shares, hk_shares, us_shares = partition_watchlist(self.watchlist)
         return {
             0: a_shares,
             1: hk_shares,
-            2: list(INDEX_SYMBOLS),
-            3: list(self.favorite_symbols),
+            2: us_shares,
+            INDEX_TAB: list(INDEX_SYMBOLS),
+            FAVORITE_TAB: list(self.favorite_symbols),
         }.get(self.market_tabs.currentIndex(), [])
 
     def _current_tab_refresh_symbols(self) -> list[str]:
@@ -2418,9 +2479,26 @@ class QuotePanel(QWidget):
     def _refresh_open_tab(self) -> None:
         if not self.isVisible():
             return
+        self._refresh_us_session_labels()
         symbols = self._current_tab_refresh_symbols()
         if symbols:
             self.periodic_page_refresh_requested.emit(symbols)
+
+    def _refresh_us_session_labels(self) -> None:
+        # A cached price can stay unchanged while its session ends or it ages.
+        # Update text in place, without rebuilding rows or moving the scroll bar.
+        keys = {key for key, quote in self._quote_cache.items() if quote.symbol.market == "us"}
+        if not keys:
+            return
+        self._update_quote_rows(keys)
+        if self.symbol_input.hasFocus():
+            return
+        try:
+            key = normalize_symbol(self._current_input_symbol()).provider_symbol
+        except SymbolError:
+            return
+        if key in keys:
+            self._display_quote(self._quote_cache[key])
 
     def _clear_quote_display(self) -> None:
         self._resolved_input_symbol = None
@@ -2437,8 +2515,9 @@ class QuotePanel(QWidget):
         return {
             0: self.a_share_list,
             1: self.hk_share_list,
-            2: self.index_list,
-            3: self.favorite_list,
+            2: self.us_share_list,
+            INDEX_TAB: self.index_list,
+            FAVORITE_TAB: self.favorite_list,
         }.get(self.market_tabs.currentIndex())
 
     def _select_first_current_tab_item(self) -> None:
@@ -2518,9 +2597,10 @@ class QuotePanel(QWidget):
         # Only structural edits rebuild widgets. Drop references before clear()
         # deletes the old QListWidgetItems and schedules their widgets for deletion.
         self._quote_rows.clear()
-        a_shares, hk_shares = partition_watchlist(self.watchlist)
+        a_shares, hk_shares, us_shares = partition_watchlist(self.watchlist)
         self._populate_market_list(self.a_share_list, a_shares, "暂无大A自选，点击“编辑自选”添加")
         self._populate_market_list(self.hk_share_list, hk_shares, "暂无港股自选，点击“编辑自选”添加")
+        self._populate_market_list(self.us_share_list, us_shares, "暂无美股自选，搜索 NVDA / AAPL 后保存")
         self._populate_market_list(
             self.favorite_list,
             self.favorite_symbols,
@@ -2529,8 +2609,9 @@ class QuotePanel(QWidget):
         self._populate_index_list()
         self.market_tabs.setTabText(0, f"大A ({len(a_shares)})")
         self.market_tabs.setTabText(1, f"港股 ({len(hk_shares)})")
-        self.market_tabs.setTabText(2, f"指数 ({len(INDEX_SYMBOLS)})")
-        self.market_tabs.setTabText(3, f"收藏 ({len(self.favorite_symbols)})")
+        self.market_tabs.setTabText(2, f"美股 ({len(us_shares)})")
+        self.market_tabs.setTabText(INDEX_TAB, f"指数 ({len(INDEX_SYMBOLS)})")
+        self.market_tabs.setTabText(FAVORITE_TAB, f"收藏 ({len(self.favorite_symbols)})")
         self._prune_quote_cache()
 
     def _prune_quote_cache(self) -> None:
@@ -2616,11 +2697,15 @@ class QuotePanel(QWidget):
         quote = self._quote_cache.get(symbol.provider_symbol)
         indent = "  " if compact else ""
         if quote is None:
-            return f"{indent}{symbol.display_code}  ·  {symbol.market_label}", self._flat_color()
+            name = self.stock_names.get(symbol.provider_symbol, "")
+            prefix = f"{name}  ·  " if name else ""
+            return f"{indent}{prefix}{symbol.display_code}  ·  {symbol.market_label}", self._flat_color()
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
         currency = _currency_prefix(quote.symbol.currency)
+        session_label = quote_session_label(quote)
+        session_prefix = f"[{session_label}] " if session_label else ""
         text = (
-            f"{indent}{quote.name}  ·  {quote.symbol.display_code}    "
+            f"{indent}{session_prefix}{quote.name}  ·  {quote.symbol.display_code}    "
             f"{arrow} {quote.change_percent:+.2f}%    {currency}{_price(quote.price)}"
         )
         color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
@@ -2703,7 +2788,7 @@ class QuotePanel(QWidget):
         self.settings.sync()
         selected_symbol = self._current_input_symbol()
         self._refresh_watchlist_lists()
-        if self.market_tabs.currentIndex() == 3:
+        if self.market_tabs.currentIndex() == FAVORITE_TAB:
             self._select_first_current_tab_item()
         else:
             self._select_symbol_in_current_list(selected_symbol)
@@ -2992,18 +3077,26 @@ class QuotePanel(QWidget):
         color = self._up_color() if quote.direction > 0 else self._down_color() if quote.direction < 0 else self._flat_color()
         arrow = "▲" if quote.direction > 0 else "▼" if quote.direction < 0 else "—"
 
-        _set_text_if_changed(self.name_label, f"{quote.name}  ·  {quote.symbol.display_code}  ·  {quote.symbol.market_label}")
+        session_label = quote_session_label(quote)
+        session_suffix = f" · {session_label}" if session_label else ""
+        _set_text_if_changed(self.name_label, f"{quote.name}  ·  {quote.symbol.display_code}  ·  {quote.symbol.market_label}{session_suffix}")
         _set_text_if_changed(self.price_label, f"{currency}{_price(quote.price)}")
         _set_text_if_changed(self.change_label, f"{arrow} {quote.change_percent:+.2f}%")
         for label in (self.price_label, self.change_label):
             style = f"color: {color};"
             if label.styleSheet() != style:
                 label.setStyleSheet(style)
-        if quote.symbol.market in {"hk_index", "cn_index", "gold"}:
+        if quote.symbol.market in {"hk_index", "cn_index", "us_index", "gold"}:
             unit = "美元/盎司" if quote.symbol.market == "gold" else "指数点"
             _set_text_if_changed(self.details_label,
                 f"今开 {_price(quote.open_price)}    最高 {_price(quote.high)}    最低 {_price(quote.low)}\n"
                 f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}    单位 {unit}"
+            )
+        elif quote.symbol.market == "us" and quote.session in {"pre", "after", "overnight"}:
+            _set_text_if_changed(self.details_label,
+                f"基准收盘 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}\n"
+                f"时段最高 {_price(quote.high)}    最低 {_price(quote.low)}\n"
+                f"时段成交额 US${_human_money(quote.amount)}    换手 --"
             )
         else:
             turnover = "--" if quote.turnover_rate is None else f"{quote.turnover_rate:.2f}%"
@@ -3012,7 +3105,11 @@ class QuotePanel(QWidget):
                 f"昨收 {_price(quote.previous_close)}    涨跌 {quote.change:+.3f}\n"
                 f"成交额 {_human_money(quote.amount)}    换手 {turnover}"
             )
-        _set_text_if_changed(self.status_label, f"{quote.source} · {quote.quote_time}\n行情可能延迟，仅供参考，不作为交易依据")
+        time_label = " 美东" if quote.symbol.market in US_MARKETS else ""
+        note = quote.session_note or "行情可能延迟，仅供参考，不作为交易依据"
+        short_note = note if len(note) <= 42 else note[:41] + "…"
+        _set_text_if_changed(self.status_label, f"{quote.source} · {quote.quote_time}{time_label}\n{short_note}")
+        self.status_label.setToolTip(f"{note}\n行情可能延迟，仅供参考，不作为交易依据")
         self.quote_loaded.emit(quote)
 
     @Slot(str)
@@ -3044,6 +3141,7 @@ class QuotePanel(QWidget):
     @trace_ui_operation("quote_panel_show")
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        self._refresh_us_session_labels()
         self._open_tab_refresh_timer.start()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
@@ -3476,12 +3574,14 @@ class StockPetWidget(QWidget):
         prefix = _currency_prefix(quote.symbol.currency)
         suffix = " 点" if quote.symbol.currency == "PTS" else ""
         marker = "★ " if favorite else ""
+        session_label = quote_session_label(quote)
+        session_prefix = f"[{session_label}] " if session_label else ""
         self._bubble_showing_favorites = favorite
         self._bubble_direction = quote.direction
         self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._resize_for_bubble(2)
         self.bubble.setText(
-            f"{escape(marker + quote.name)}&nbsp;&nbsp;{arrow} {quote.change_percent:+.2f}%<br>"
+            f"{escape(marker + session_prefix + quote.name)}&nbsp;&nbsp;{arrow} {quote.change_percent:+.2f}%<br>"
             f"{escape(quote.symbol.display_code)}&nbsp;&nbsp;{escape(prefix + _price(quote.price) + suffix)}"
         )
         self._apply_bubble_theme(self.panel.current_theme)
@@ -3520,6 +3620,9 @@ class StockPetWidget(QWidget):
             else:
                 color = "#40516a" if is_light else "#c7d1de"
             name = quote.name if len(quote.name) <= 11 else f"{quote.name[:10]}…"
+            session_label = quote_session_label(quote)
+            if session_label:
+                name = f"[{session_label}] {name}"
             prefix = _currency_prefix(quote.symbol.currency)
             suffix = "点" if quote.symbol.currency == "PTS" else ""
             lines.append(
@@ -3983,9 +4086,15 @@ class StockPetWidget(QWidget):
         self._save_alert_cache()
 
     def _process_alert_quote(self, symbol_key: str, quote: Quote) -> None:
+        if quote.symbol.market == "us" and not us_quote_is_current(quote):
+            return  # Do not alert on yesterday's regular quote during overnight.
         quote_date = quote.quote_time.strip().split(" ", 1)[0]
         if len(quote_date) != 10 or quote_date[4:5] != "-" or quote_date[7:8] != "-":
             quote_date = datetime.now(MARKET_TIMEZONE).date().isoformat()
+        if quote.symbol.market == "us":
+            # An overnight session belongs to the next trading day, and must
+            # not rearm merely because the New York clock passed midnight.
+            quote_date = f"{quote.session_date or quote_date}:{quote.session or 'regular'}"
 
         if self._alert_quote_dates.get(symbol_key) != quote_date:
             self._alert_states.pop(symbol_key, None)
@@ -4018,9 +4127,11 @@ class StockPetWidget(QWidget):
         if direction and active_direction != direction and crossed_threshold:
             self._alert_states[symbol_key] = direction
             action = "上涨" if direction > 0 else "下跌"
+            session_label = quote_session_label(quote)
+            session_prefix = f"[{session_label}] " if session_label else ""
             self.alert_requested.emit(
                 "股票桌宠提醒",
-                f"{quote.name} {quote.symbol.display_code} {action} {abs(percent):.2f}%\n"
+                f"{session_prefix}{quote.name} {quote.symbol.display_code} {action} {abs(percent):.2f}%\n"
                 f"首次突破提醒阈值 ±{self.alert_threshold:.1f}% · {quote.quote_time}",
             )
 
@@ -4231,7 +4342,9 @@ class StockPetWidget(QWidget):
         self.pet_label.move(self._pet_image_x, self._pet_image_y + offset)
 
 
-def _price(value: float) -> str:
+def _price(value: float | None) -> str:
+    if value is None:
+        return "--"
     if abs(value) >= 100:
         return f"{value:.2f}"
     if abs(value) >= 1:
@@ -4252,5 +4365,5 @@ def _human(value: float) -> str:
     return f"{value:.0f}"
 
 
-def _human_money(value: float) -> str:
-    return _human(value)
+def _human_money(value: float | None) -> str:
+    return "--" if value is None else _human(value)

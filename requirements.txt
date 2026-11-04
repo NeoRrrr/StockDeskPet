@@ -1,3 +1,4 @@
 PySide6-Essentials>=6.8,<7
 velopack==1.2.0
 futu-api==10.9.6908
+tzdata>=2026.3

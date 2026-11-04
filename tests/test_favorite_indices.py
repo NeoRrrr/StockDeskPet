@@ -27,7 +27,8 @@ class FavoriteIndexTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.settings = QSettings(str(Path(directory.name) / "settings.ini"), QSettings.IniFormat)
-        self.codes = [*INDEX_SYMBOLS, "01810", "159516"]
+        # These fixtures exercise the existing China daytime bubble window.
+        self.codes = [*(code for code in INDEX_SYMBOLS if normalize_symbol(code).market != "us_index"), "01810", "159516"]
         for key, value in {
             "quote_source": "tencent", "alerts_enabled": False,
             "favorites": self.codes, "favorite_bubble_page_size": 10,
@@ -113,6 +114,25 @@ class FavoriteIndexTests(unittest.TestCase):
         self.assertEqual(pet.current_skin, DSH_SKIN_KEY)
         self.assertIsNotNone(pet._animated_skin)
         self.assertFalse(pet.pet_label.pixmap().isNull())
+
+    def test_us_stock_continues_after_indices_close(self):
+        self.codes = ["US.NVDA", "DJI", "IXIC", "SPX"]
+        self.settings.setValue("favorites", self.codes)
+        self.at = datetime(2026, 11, 6, 22, 30, tzinfo=MARKET_TIMEZONE)
+        pet = self.load_favorites()
+        self.assertEqual([q.symbol.code for q in pet._visible_favorite_quotes()], self.codes)
+        self.assertIn("US$40", pet.bubble.text())
+        for code in ("DJI", "IXIC", "SPX"):
+            self.assertIn(code, pet.bubble.text())
+        self.assertIn("40点", pet.bubble.text())
+        # Beijing Saturday morning is still Friday evening in New York.
+        self.at = datetime(2026, 11, 7, 5, 29, tzinfo=MARKET_TIMEZONE)
+        self.assertEqual(len(pet._visible_favorite_quotes()), 4)
+        self.at = self.at.replace(minute=30)
+        self.assertEqual([q.symbol.code for q in pet._visible_favorite_quotes()], ["US.NVDA"])
+        self.at = self.at.replace(hour=9, minute=30)
+        pet._show_next_favorite()
+        self.assertTrue(pet.bubble.isHidden())
 
     def test_existing_skin_choices_are_preserved(self):
         for saved in ("default", "ikunchick", DSH_SKIN_KEY):

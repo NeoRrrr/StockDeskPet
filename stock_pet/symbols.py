@@ -14,6 +14,7 @@ MAX_WATCHLIST_ITEMS = 100
 
 _PREFIXED_RE = re.compile(r"^(HK|SH|SZ|BJ)(\d{1,6})$", re.IGNORECASE)
 _SUFFIXED_RE = re.compile(r"^(\d{1,6})\.(HK|SS|SH|SZ|BJ)$", re.IGNORECASE)
+_US_TICKER_RE = re.compile(r"^[A-Z]{1,8}(?:\.[A-Z])?$")
 
 _SPECIAL_SYMBOLS: dict[str, tuple[str, str, str, str, str]] = {
     "HSI": ("hkHSI", "HSI", "hk_index", "港股指数", "PTS"),
@@ -25,10 +26,28 @@ _SPECIAL_SYMBOLS: dict[str, tuple[str, str, str, str, str]] = {
     "CHINEXT": ("sz399006", "CHINEXT", "cn_index", "大A指数", "PTS"),
     "GOLD": ("hf_XAU", "GOLD", "gold", "伦敦金", "USD"),
     "XAU": ("hf_XAU", "GOLD", "gold", "伦敦金", "USD"),
+    "DJI": ("us.DJI", "DJI", "us_index", "美股指数", "PTS"),
+    "IXIC": ("us.IXIC", "IXIC", "us_index", "美股指数", "PTS"),
+    "SPX": ("us.INX", "SPX", "us_index", "美股指数", "PTS"),
+    "INX": ("us.INX", "SPX", "us_index", "美股指数", "PTS"),
 }
 
 
 def normalize_symbol(raw: str) -> StockSymbol:
+    compact = re.sub(r"\s+", "", raw or "")
+    upper = compact.upper()
+    provider_index = {"US.DJI": "DJI", "US.IXIC": "IXIC", "US.INX": "SPX"}.get(upper)
+    if provider_index:
+        return normalize_symbol(provider_index)
+    # Keep a market-qualified canonical ID so US.GOLD is not spot gold, and
+    # provider keys round-trip without stripping the dot in share classes.
+    if upper.startswith("US."):
+        return _make_us_symbol(raw, upper[3:].replace("-", "."))
+    if upper.endswith(".US"):
+        return _make_us_symbol(raw, upper[:-3].replace("-", "."))
+    if compact.startswith("us") and len(compact) > 2 and compact[2:].isupper():
+        ticker = upper[2:]
+        return _make_us_symbol(raw, ticker)
     value = re.sub(r"[\s_-]+", "", raw or "").upper()
     if not value:
         raise SymbolError("请输入股票代码，例如 00700、600519 或 000001。")
@@ -57,7 +76,9 @@ def normalize_symbol(raw: str) -> StockSymbol:
         return _make_symbol(raw, prefix.lower(), digits)
 
     if not value.isdigit():
-        raise SymbolError("代码格式不正确。支持 00700、HK00700、600519、SH600519、000001。")
+        if _US_TICKER_RE.fullmatch(upper.replace("-", ".")):
+            return _make_us_symbol(raw, upper.replace("-", "."))
+        raise SymbolError("代码格式不正确。支持 00700、SH600519、000001、NVDA、US.AAPL。")
 
     if len(value) <= 5:
         return _make_symbol(raw, "hk", value)
@@ -88,7 +109,7 @@ def normalize_watchlist(
         if not value or not value.strip():
             continue
         symbol = normalize_symbol(value)
-        if symbol.market not in {"hk", "sh", "sz", "bj"}:
+        if symbol.market not in {"hk", "sh", "sz", "bj", "us"}:
             raise SymbolError("指数和黄金已固定显示在“指数”Tab，无需加入自选股。")
         if symbol.provider_symbol in seen:
             continue
@@ -99,15 +120,25 @@ def normalize_watchlist(
     return normalized
 
 
-def partition_watchlist(values: list[str]) -> tuple[list[str], list[str]]:
-    """Return normalized A-share and HK-share IDs while preserving their order."""
+def partition_watchlist(values: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """Return A-share, HK-share and US-share IDs, preserving each group's order."""
     a_shares: list[str] = []
     hk_shares: list[str] = []
+    us_shares: list[str] = []
     for value in normalize_watchlist(values):
         symbol = normalize_symbol(value)
-        target = hk_shares if symbol.market == "hk" else a_shares
+        target = {"hk": hk_shares, "us": us_shares}.get(symbol.market, a_shares)
         target.append(symbol.code)
-    return a_shares, hk_shares
+    return a_shares, hk_shares, us_shares
+
+
+def _make_us_symbol(raw: str, ticker: str) -> StockSymbol:
+    if not _US_TICKER_RE.fullmatch(ticker):
+        raise SymbolError("美股代码格式不正确，例如 NVDA、US.AAPL、BRK.B。")
+    return StockSymbol(
+        raw=raw, provider_symbol=f"us{ticker}", code=f"US.{ticker}",
+        market="us", market_label="美股", currency="USD",
+    )
 
 
 def _make_symbol(raw: str, market: str, digits: str) -> StockSymbol:

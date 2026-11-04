@@ -216,7 +216,7 @@ class QuotePanelTests(unittest.TestCase):
                 panel.hk_share_list.currentItem().data(Qt.ItemDataRole.UserRole),
                 DEFAULT_HK_WATCHLIST[0],
             )
-            panel.market_tabs.setCurrentIndex(2)
+            panel.market_tabs.setCurrentIndex(3)
 
             a_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[0]]
             hk_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[1]]

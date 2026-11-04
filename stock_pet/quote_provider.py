@@ -101,6 +101,12 @@ class TencentQuoteProvider:
         keyword = (query or "").strip()
         if not keyword:
             return []
+        try:
+            symbol = normalize_symbol(keyword)
+            if symbol.market == "us":
+                keyword = symbol.code.removeprefix("US.")
+        except SymbolError:
+            pass
         url = self.search_endpoint.format(query=quote_plus(keyword))
         try:
             payload = self._transport(url).decode("utf-8", errors="replace")
@@ -138,12 +144,17 @@ def parse_tencent_search_payload(payload: str, limit: int = 8) -> list[StockSear
             continue
         market, code, name, _pinyin, security_type = fields[:5]
         market = market.lower()
-        if market not in {"hk", "sh", "sz", "bj"}:
+        if market not in {"hk", "sh", "sz", "bj", "us"}:
             continue
         if not (security_type.startswith("GP") or security_type == "ETF"):
             continue
         try:
-            symbol = normalize_symbol(f"{market}{code}")
+            # Tencent appends the listing venue (.OQ/.N/.A), not a share class.
+            if market == "us":
+                code = re.sub(r"\.(OQ|N|A|O|P|K)$", "", code.upper())
+                symbol = normalize_symbol(f"US.{code}")
+            else:
+                symbol = normalize_symbol(f"{market}{code}")
         except SymbolError:
             continue
         if symbol.provider_symbol in seen:
@@ -180,11 +191,13 @@ def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
     high = _number(fields, 33)
     low = _number(fields, 34)
 
-    if symbol.market in {"hk", "hk_index"}:
+    if symbol.market in {"hk", "hk_index", "us", "us_index"}:
         volume = _number(fields, 36, _number(fields, 6))
         volume_unit = "股"
         amount = _number(fields, 37)
-        turnover_rate = _optional_number(fields, 59)
+        turnover_rate = _optional_number(fields, 38 if symbol.market == "us" else 59)
+        if symbol.market == "us_index":
+            turnover_rate = None
     else:
         volume = _number(fields, 36, _number(fields, 6))
         volume_unit = "手"
@@ -215,6 +228,9 @@ def parse_tencent_payload(payload: str, symbol: StockSymbol) -> Quote:
         quote_time=_normalize_time(fields[30].strip()),
         source="腾讯行情（公共网页接口）",
         turnover_rate=turnover_rate,
+        session="regular" if symbol.market == "us" else "",
+        session_date=_normalize_time(fields[30].strip()).split(" ", 1)[0] if symbol.market == "us" else "",
+        session_note="腾讯仅提供常规行情；盘前/盘后/夜盘需 OpenD" if symbol.market == "us" else "",
     )
 
 

@@ -36,6 +36,7 @@ try {
         --icon 'assets\app_icon.ico' `
         --add-data 'assets;assets' `
         --collect-data futu `
+        --collect-data tzdata `
         app.py
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed; no package was produced' }
 }

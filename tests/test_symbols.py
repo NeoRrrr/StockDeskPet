@@ -51,7 +51,7 @@ class NormalizeSymbolTests(unittest.TestCase):
     def test_watchlist_is_partitioned_by_market(self) -> None:
         self.assertEqual(
             partition_watchlist(["00700", "600519", "000001", "00941"]),
-            (["600519", "000001"], ["00700", "00941"]),
+            (["600519", "000001"], ["00700", "00941"], []),
         )
 
     def test_market_index_aliases(self) -> None:
