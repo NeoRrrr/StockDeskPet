@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
@@ -18,7 +19,8 @@ from stock_pet.hybrid_quote_provider import FutuQuoteProvider, quote_from_futu_r
 from stock_pet.models import quote_is_older, quote_session_label, us_quote_is_current
 from stock_pet.symbols import normalize_symbol
 from stock_pet.ui import (
-    QuotePanel, StockPetWidget, US_DEFAULTS_SETTINGS_KEY,
+    QuotePanel, SettingsDialog, StockPetWidget, US_DEFAULTS_SETTINGS_KEY,
+    US_OVERNIGHT_BUBBLE_SETTINGS_KEY,
     _is_open_for_automatic_refresh, _is_visible_in_idle_bubble,
 )
 from stock_pet.quote_provider import TencentQuoteProvider
@@ -263,6 +265,7 @@ class ExtendedUITests(unittest.TestCase):
             "quote_source": "tencent", "alerts_enabled": True,
             "market_defaults_v1_added": True, "a_share_etf_defaults_v1_added": True,
             US_DEFAULTS_SETTINGS_KEY: True,
+            US_OVERNIGHT_BUBBLE_SETTINGS_KEY: True,
         }.items():
             self.settings.setValue(key, value)
         for target in ("stock_pet.ui.QThreadPool.globalInstance", "stock_pet.ui.QTimer.singleShot"):
@@ -282,6 +285,156 @@ class ExtendedUITests(unittest.TestCase):
         widget.close()
         widget.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def at_session_time(self, text):
+        now = et(text)
+        stack = ExitStack()
+        stack.enter_context(patch("stock_pet.ui.us_session_at", return_value=us_session_at(now, close_grace=True)))
+        stack.enter_context(patch("stock_pet.models.us_now", return_value=now))
+        stack.enter_context(patch("stock_pet.ui._is_visible_in_idle_bubble",
+                                  side_effect=lambda code: _is_visible_in_idle_bubble(code, now)))
+        return stack
+
+    def make_pet(self):
+        pet = StockPetWidget(self.settings)
+        self.addCleanup(self.close_widget, pet)
+        return pet
+
+    def test_overnight_checkbox_defaults_off_and_remembers_explicit_choices(self):
+        self.settings.remove(US_OVERNIGHT_BUBBLE_SETTINGS_KEY)
+        pet = self.make_pet()
+        self.assertFalse(pet.show_us_overnight_bubble)
+        dialog = SettingsDialog(self.settings, pet.provider)
+        self.addCleanup(self.close_widget, dialog)
+        self.assertFalse(dialog.us_overnight_bubble_checkbox.isChecked())
+        changes = []
+        dialog.us_overnight_bubble_changed.connect(changes.append)
+        dialog.us_overnight_bubble_checkbox.setChecked(True)
+        self.assertEqual(changes, [True])
+        # Exercise persisted INI values and a new application instance.
+        reloaded = QSettings(self.settings.fileName(), QSettings.IniFormat)
+        restored = SettingsDialog(reloaded, pet.provider, theme="beige")
+        self.addCleanup(self.close_widget, restored)
+        self.assertTrue(restored.us_overnight_bubble_checkbox.isChecked())
+        self.assertTrue(self.make_pet().show_us_overnight_bubble)
+        restored.us_overnight_bubble_checkbox.setChecked(False)
+        self.assertFalse(self.make_pet().show_us_overnight_bubble)
+
+    def test_settings_signal_hides_only_bubble_immediately_without_fetching(self):
+        pet = self.make_pet()
+        quote = night_quote()
+        with self.at_session_time("2026-11-04 01:01:01"):
+            pet.panel.update_watchlist_quotes([quote])
+            pet.panel._display_quote(quote)
+            pet._show_next_favorite()
+            self.assertFalse(pet.bubble.isHidden())
+            detail = pet.panel.price_label.text()
+            timer_interval = pet._favorite_refresh_timer.interval()
+
+            def toggle_in_dialog(dialog):
+                self.addCleanup(self.close_widget, dialog)
+                dialog.us_overnight_bubble_checkbox.setChecked(False)
+                self.assertTrue(pet.bubble.isHidden())
+                return 0
+
+            with patch.object(SettingsDialog, "exec", toggle_in_dialog), patch.object(
+                pet, "refresh_favorites"
+            ) as fetch:
+                pet.panel.open_settings()
+                fetch.assert_not_called()
+            self.assertFalse(pet.show_us_overnight_bubble)
+            self.assertFalse(pet._favorite_carousel_timer.isActive())
+            self.assertEqual(pet.panel.price_label.text(), detail)
+            self.assertIn("夜盘", pet.panel.name_label.text())
+            self.assertIs(pet.panel._quote_cache["usNVDA"], quote)
+            self.assertEqual(pet._favorite_quotes, [quote])
+            self.assertEqual(pet._favorite_refresh_timer.interval(), timer_interval)
+            self.assertTrue(pet.alerts_enabled)
+            pet._apply_us_overnight_bubble(True)
+            self.assertFalse(pet.bubble.isHidden())
+            self.assertIn("英伟达", pet.bubble.text())
+
+    def test_hidden_overnight_does_not_reappear_on_late_result_or_error(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, "false")
+        pet = self.make_pet()
+        with self.at_session_time("2026-11-04 01:01:01"):
+            pet._show_favorite_prompt()
+            self.assertTrue(pet.bubble.isHidden())
+            pet.refresh_favorites()
+            self.assertEqual(pet._favorite_task.symbols, ["US.NVDA"])
+            pet._on_favorite_result(([], ["timeout"]))
+            self.assertTrue(pet.bubble.isHidden())
+            pet._on_favorite_result(([night_quote()], []))
+            self.assertTrue(pet.bubble.isHidden())
+            self.assertIn("usNVDA", pet.panel._quote_cache)
+            pet._on_favorite_result(([], ["timeout"]))
+            self.assertTrue(pet.bubble.isHidden())
+            # An old regular quote from Tencent must not bypass the preference.
+            pet._favorite_quotes = [replace(night_quote(), session="regular")]
+            pet._show_next_favorite()
+            self.assertTrue(pet.bubble.isHidden())
+
+    def test_overnight_filter_keeps_other_markets_and_repaginates(self):
+        self.settings.setValue("favorites", ["US.NVDA", "01810", "GOLD"])
+        pet = self.make_pet()
+        night = night_quote()
+        hk = replace(night, symbol=normalize_symbol("01810"), name="小米", session="regular")
+        gold = replace(night, symbol=normalize_symbol("GOLD"), name="黄金", session="regular")
+        with self.at_session_time("2026-11-04 01:01:01"):
+            pet.panel.update_watchlist_quotes([night, hk, gold])
+            pet._apply_bubble_settings(1, 10, 100)
+            self.assertEqual(pet._favorite_page_count(), 3)
+            pet._favorite_index = 2
+            pet._apply_us_overnight_bubble(False)
+            self.assertEqual(pet._visible_favorite_quotes(), [hk, gold])
+            self.assertEqual(pet._favorite_page_count(), 2)
+            self.assertTrue(pet._favorite_carousel_timer.isActive())
+            self.assertIn("小米", pet.bubble.text())
+            pet._show_next_favorite()
+            self.assertIn("黄金", pet.bubble.text())
+            self.assertEqual(len(pet._favorite_quotes), 3)
+
+    def test_other_us_sessions_still_display_and_overnight_cache_stays_hidden(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False)
+        pet = self.make_pet()
+        for stamp, kind in (("2026-11-04 04:00:00", "pre"),
+                            ("2026-11-04 10:00:00", "regular"),
+                            ("2026-11-04 17:00:00", "after"),
+                            ("2026-11-06 20:15:00", "after")):
+            with self.subTest(kind=kind, stamp=stamp), self.at_session_time(stamp):
+                pet._favorite_quotes = [replace(night_quote(), session=kind, quote_time=stamp)]
+                pet._show_next_favorite()
+                self.assertFalse(pet.bubble.isHidden())
+                if kind == "regular":
+                    self.assertTrue(pet._is_symbol_visible_in_bubble("DJI"))
+        with self.at_session_time("2026-11-04 04:00:00"):
+            pet._favorite_quotes = [night_quote()]
+            pet._show_next_favorite()
+            self.assertTrue(pet.bubble.isHidden())
+
+    def test_crossing_into_overnight_hides_bubble_on_periodic_refresh(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False)
+        pet = self.make_pet()
+        pet._favorite_quotes = [replace(night_quote(), session="after")]
+        with self.at_session_time("2026-11-03 19:59:59"):
+            pet._show_next_favorite()
+            self.assertFalse(pet.bubble.isHidden())
+        with self.at_session_time("2026-11-03 20:00:00"):
+            pet.refresh_favorites()
+            self.assertTrue(pet.bubble.isHidden())
+        with self.at_session_time("2026-11-04 04:01:00"):
+            pet._on_favorite_result(([replace(night_quote(), session="pre")], []))
+            self.assertFalse(pet.bubble.isHidden())
+
+    def test_enabling_overnight_respects_zero_bubble_rows(self):
+        pet = self.make_pet()
+        with self.at_session_time("2026-11-04 01:01:01"):
+            pet._favorite_quotes = [night_quote()]
+            pet._apply_bubble_settings(0, 10, 100)
+            pet._apply_us_overnight_bubble(False)
+            pet._apply_us_overnight_bubble(True)
+            self.assertTrue(pet.bubble.isHidden())
+            self.assertFalse(pet._favorite_carousel_timer.isActive())
 
     def test_session_labels_and_metrics_render_in_place(self):
         panel = QuotePanel(TencentQuoteProvider(), self.settings)

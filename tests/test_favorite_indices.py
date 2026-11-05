@@ -33,6 +33,7 @@ class FavoriteIndexTests(unittest.TestCase):
             "quote_source": "tencent", "alerts_enabled": False,
             "favorites": self.codes, "favorite_bubble_page_size": 10,
             "skin": "default",
+            "show_us_overnight_bubble": True,
         }.items():
             self.settings.setValue(key, value)
         self.at = datetime(2026, 10, 28, 14, 45, tzinfo=MARKET_TIMEZONE)

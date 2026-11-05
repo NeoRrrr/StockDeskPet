@@ -14,10 +14,11 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import sys
+import traceback
 from time import monotonic
 from typing import Callable
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QTimer, QtMsgType, qInstallMessageHandler, qVersion
 
 from . import __version__
 
@@ -28,6 +29,12 @@ MAX_LOG_BYTES = 2 * 1024 * 1024
 LOG_BACKUPS = 2
 SLOW_UI_SECONDS = 0.1
 _active_monitor: UiStallMonitor | None = None
+
+
+def record_render_event(event: str, detail: str, *, warning: bool = False) -> None:
+    monitor = _active_monitor
+    if monitor is not None and monitor.active:
+        monitor._render_events.append((logging.WARNING if warning else logging.INFO, event, detail))
 
 
 def trace_ui_operation(name: str):
@@ -85,6 +92,16 @@ class UiStallMonitor(QObject):
         self._last_heartbeat = monotonic()
         self._armed = False
         self._slow_operations: deque[tuple[str, float]] = deque(maxlen=32)
+        self._render_events: deque[tuple[int, str, str]] = deque(maxlen=128)
+        # Qt invokes its message handler on the emitting thread. Only append to
+        # a bounded deque there; the GUI heartbeat owns file I/O and rotation.
+        self._qt_messages: deque[tuple[str, str]] = deque(maxlen=64)
+        self._python_errors: deque[str] = deque(maxlen=16)
+        self._qt_handler = self._on_qt_message
+        self._exception_handler = self._on_python_exception
+        self._previous_qt_handler = None
+        self._previous_exception_handler = None
+        self._hooks_installed = False
         self._timer = QTimer(self)
         self._timer.setInterval(heartbeat_ms)
         self._timer.timeout.connect(self._heartbeat)
@@ -99,10 +116,14 @@ class UiStallMonitor(QObject):
             ))
             self._logger.addHandler(self._handler)
             self._logger.info(
-                "SESSION_START version=%s pid=%s python=%s threshold=%.1fs context=%s",
-                __version__, os.getpid(), sys.version.split()[0],
+                "SESSION_START version=%s pid=%s python=%s qt=%s render_guard=1 threshold=%.1fs context=%s",
+                __version__, os.getpid(), sys.version.split()[0], qVersion(),
                 threshold_seconds, self._last_context,
             )
+            self._previous_qt_handler = qInstallMessageHandler(self._qt_handler)
+            self._previous_exception_handler = sys.excepthook
+            sys.excepthook = self._exception_handler
+            self._hooks_installed = True
             self._arm()
             self._timer.start()
             _active_monitor = self
@@ -116,6 +137,40 @@ class UiStallMonitor(QObject):
     def set_context_provider(self, provider: Callable[[], str]) -> None:
         # Called only on the UI thread; no background worker accesses widgets.
         self._context = provider
+
+    def _on_qt_message(self, kind, context, message: str) -> None:
+        if kind in {QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg}:
+            # Limit payload and retain only rendering/lifecycle diagnostics.
+            if any(word in message for word in (
+                "QPainter", "QBackingStore", "QWidget", "QWindows", "QPixmap",
+                "QImage", "UpdateLayeredWindow", "QPaintDevice", "QObject::",
+            )):
+                self._qt_messages.append((str(getattr(context, "category", "qt")),
+                                          message.replace("\n", " ").replace("\r", " ")[:1000]))
+        if self._previous_qt_handler is not None:
+            self._previous_qt_handler(kind, context, message)
+
+    def _on_python_exception(self, kind, value, tb) -> None:
+        # Do not retain exception objects/tracebacks, locals or exception values
+        # (which could contain search text/quotes). Frame locations suffice.
+        frames = traceback.extract_tb(tb, limit=12)
+        location = " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames)
+        self._python_errors.append(f"type={kind.__name__} frames={location}")
+        if self._previous_exception_handler is not None:
+            self._previous_exception_handler(kind, value, tb)
+
+    def _drain_render_logs(self) -> None:
+        messages: dict[tuple[str, str], int] = {}
+        while self._qt_messages:
+            key = self._qt_messages.popleft()
+            messages[key] = messages.get(key, 0) + 1
+        for (category, message), count in messages.items():
+            self._logger.warning("QT_RENDER category=%s count=%s message=%s", category, count, message)
+        while self._python_errors:
+            self._logger.error("UI_CALLBACK_EXCEPTION %s", self._python_errors.popleft())
+        while self._render_events:
+            level, event, detail = self._render_events.popleft()
+            self._logger.log(level, "%s %s", event, detail)
 
     def _arm(self) -> None:
         if self._handler is not None:
@@ -139,6 +194,7 @@ class UiStallMonitor(QObject):
         if self._handler is None:
             return
         try:
+            self._drain_render_logs()
             while self._slow_operations:
                 operation, duration = self._slow_operations.popleft()
                 self._logger.warning("SLOW_UI operation=%s duration_ms=%.1f", operation, duration * 1000)
@@ -174,13 +230,21 @@ class UiStallMonitor(QObject):
             _active_monitor = None
         self._timer.stop()
         self._cancel()
+        if self._hooks_installed:
+            self._hooks_installed = False
+            current = qInstallMessageHandler(self._previous_qt_handler)
+            if current is not self._qt_handler:
+                qInstallMessageHandler(current)
+            if sys.excepthook is self._exception_handler:
+                sys.excepthook = self._previous_exception_handler
         if self._handler is not None:
             handler = self._handler
-            self._handler = None
             try:
+                self._drain_render_logs()
                 self._logger.info("SESSION_STOP")
             except Exception:
                 pass
+            self._handler = None
             self._logger.removeHandler(handler)
             try:
                 handler.close()

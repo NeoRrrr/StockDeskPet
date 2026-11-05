@@ -40,6 +40,7 @@ from . import __version__
 from .animated_skin import AnimatedSkin, DSH_CANVAS_WIDTH, DSH_SKIN_KEY, ONE_SHOT_STATES
 from .expression_skin import EXPRESSION_SKIN_KEY, ExpressionSkin
 from .diagnostics import trace_ui_operation
+from .painting import WindowPaintGuard
 from .hybrid_quote_provider import HybridQuoteProvider
 from .models import Quote, StockSearchResult, US_TIMEZONE, quote_is_older, quote_session_label, us_quote_is_current
 from .quote_provider import TencentQuoteProvider
@@ -121,6 +122,7 @@ FAVORITE_BUBBLE_FONT_PERCENT = 100
 FAVORITE_BUBBLE_FONT_MIN_PERCENT = 80
 FAVORITE_BUBBLE_FONT_MAX_PERCENT = 150
 FAVORITE_BUBBLE_FONT_SETTINGS_KEY = "favorite_bubble_font_percent"
+US_OVERNIGHT_BUBBLE_SETTINGS_KEY = "show_us_overnight_bubble"
 INITIAL_QUOTE_RETRY_SECONDS = 30
 INITIAL_QUOTE_RETRY_MAX_SECONDS = 300
 ALERT_REARM_MARGIN_PERCENT = 0.2
@@ -141,6 +143,9 @@ _UI_FONTS_LOADED = False
 def _set_text_if_changed(widget: QLabel | QLineEdit, text: str) -> None:
     if widget.text() != text:
         widget.setText(text)
+        guard = getattr(widget.window(), "_paint_guard", None)
+        if guard is not None:
+            guard.request("text_changed")
 
 
 def _is_open_for_automatic_refresh(
@@ -1342,6 +1347,7 @@ class WatchlistDialog(QDialog):
 
 class SettingsDialog(QDialog):
     bubble_settings_changed = Signal(int, int, int)
+    us_overnight_bubble_changed = Signal(bool)
 
     def __init__(
         self,
@@ -1359,7 +1365,7 @@ class SettingsDialog(QDialog):
         self._release_url = f"{PROJECT_URL}/releases"
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setFixedSize(430, 646)
+        self.setFixedSize(430, 680)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
@@ -1508,6 +1514,17 @@ class SettingsDialog(QDialog):
         font_row.addWidget(self.bubble_font_value)
         bubble_layout.addLayout(font_row)
 
+        self.us_overnight_bubble_checkbox = QCheckBox("显示美股夜盘（仅气泡）")
+        self.us_overnight_bubble_checkbox.setChecked(
+            _setting_bool(settings.value(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False), default=False)
+        )
+        self.us_overnight_bubble_checkbox.setToolTip(
+            "关闭后隐藏美股夜盘气泡；行情卡、行情刷新和系统提醒不受影响。"
+            "盘前、盘中、盘后气泡仍按原规则显示。"
+        )
+        self.us_overnight_bubble_checkbox.toggled.connect(self._on_us_overnight_bubble_changed)
+        bubble_layout.addWidget(self.us_overnight_bubble_checkbox)
+
         settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, saved_page_size)
         settings.setValue(
             FAVORITE_BUBBLE_PAGE_INTERVAL_SETTINGS_KEY,
@@ -1577,7 +1594,7 @@ class SettingsDialog(QDialog):
 
         stylesheet = """
             QDialog { background: #0c1622; }
-            QLabel { color: #c8d2df; font-family: "Noto Sans SC"; }
+            QLabel, QCheckBox { color: #c8d2df; font-family: "Noto Sans SC"; }
             QLabel#settingsTitle { color: #eef4fb; font: 600 20px "Microsoft YaHei UI"; }
             QLabel#settingsSubtitle { color: #7f90a5; font-size: 12px; }
             QFrame#sourceCard, QFrame#bubbleCard, QFrame#versionCard {
@@ -1633,7 +1650,7 @@ class SettingsDialog(QDialog):
         if theme == "beige":
             stylesheet += """
                 QDialog { background: #f6f8fb; }
-                QLabel { color: #243247; }
+                QLabel, QCheckBox { color: #243247; }
                 QLabel#settingsTitle { color: #17253a; }
                 QLabel#settingsSubtitle, QLabel#providerStatus, QLabel#versionValue,
                 QLabel#updateStatus, QLabel#bubbleHelp, QLabel#bubbleSettingValue { color: #68778c; }
@@ -1672,6 +1689,12 @@ class SettingsDialog(QDialog):
                 }
             """
         self.setStyleSheet(stylesheet)
+
+    @Slot(bool)
+    def _on_us_overnight_bubble_changed(self, enabled: bool) -> None:
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, enabled)
+        self.settings.sync()
+        self.us_overnight_bubble_changed.emit(enabled)
 
     @Slot(int)
     def _on_bubble_settings_changed(self, _value: int) -> None:
@@ -1804,9 +1827,11 @@ class QuotePanel(QWidget):
     periodic_page_refresh_requested = Signal(object)
     theme_changed = Signal(str)
     bubble_settings_changed = Signal(int, int, int)
+    us_overnight_bubble_changed = Signal(bool)
 
     def __init__(self, provider: TencentQuoteProvider, settings: QSettings) -> None:
         super().__init__()
+        self._paint_guard = WindowPaintGuard(self, "quote_panel")
         _load_ui_fonts()
         self.provider = provider
         self.settings = settings
@@ -2257,6 +2282,7 @@ class QuotePanel(QWidget):
         self.theme_switch.blockSignals(was_blocked)
         self.theme_switch.setToolTip("当前浅色主题，点击切换到深色" if is_beige else "当前深色主题，点击切换到浅色")
         self.theme_switch.update()
+        self._paint_guard.request("theme_changed")
 
     @Slot(bool)
     def _on_theme_switch_toggled(self, is_beige: bool) -> None:
@@ -2442,6 +2468,7 @@ class QuotePanel(QWidget):
             self.periodic_page_refresh_requested.emit(symbols)
         if symbols and not _automatic_refresh_symbols(symbols):
             self.status_label.setText("当前市场已休市，显示最近一次行情")
+        self._paint_guard.request("tab_changed")
 
     def _current_tab_list_symbols(self) -> list[str]:
         a_shares, hk_shares, us_shares = partition_watchlist(self.watchlist)
@@ -2510,6 +2537,7 @@ class QuotePanel(QWidget):
         self.change_label.setStyleSheet("")
         self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
         self.status_label.setText("点击自选列表或输入代码/名称拉取行情；行情可能延迟，仅供参考")
+        self._paint_guard.request("detail_cleared")
 
     def _current_stock_list(self) -> QListWidget | None:
         return {
@@ -2613,6 +2641,7 @@ class QuotePanel(QWidget):
         self.market_tabs.setTabText(INDEX_TAB, f"指数 ({len(INDEX_SYMBOLS)})")
         self.market_tabs.setTabText(FAVORITE_TAB, f"收藏 ({len(self.favorite_symbols)})")
         self._prune_quote_cache()
+        self._paint_guard.request("list_structure_changed")
 
     def _prune_quote_cache(self) -> None:
         active_keys = {
@@ -2720,6 +2749,8 @@ class QuotePanel(QWidget):
                     item.setData(Qt.ItemDataRole.AccessibleTextRole, text)
                 if item.foreground().color() != QColor(color):
                     item.setForeground(QColor(color))
+        if symbol_keys:
+            self._paint_guard.request("quote_rows_changed")
 
     def _favorite_keys(self) -> set[str]:
         return {
@@ -2889,6 +2920,7 @@ class QuotePanel(QWidget):
                 font_percent,
             )
         )
+        dialog.us_overnight_bubble_changed.connect(self.us_overnight_bubble_changed.emit)
         dialog.exec()
 
     def _save_watchlist_config(
@@ -2946,6 +2978,7 @@ class QuotePanel(QWidget):
         self.setWindowOpacity(self.panel_opacity / 100.0)
         self.settings.setValue("panel_opacity", self.panel_opacity)
         self.settings.sync()
+        self._paint_guard.request("opacity_changed")
 
     @Slot()
     def fetch_quote(self) -> None:
@@ -3069,6 +3102,7 @@ class QuotePanel(QWidget):
         self.price_label.setStyleSheet("")
         self.change_label.setStyleSheet("")
         self.details_label.setText("今开 --    最高 --    最低 --\n昨收 --    涨跌 --\n成交额 --    换手 --")
+        self._paint_guard.request("detail_pending")
 
     @trace_ui_operation("detail_render")
     def _display_quote(self, quote: Quote) -> None:
@@ -3110,6 +3144,7 @@ class QuotePanel(QWidget):
         short_note = note if len(note) <= 42 else note[:41] + "…"
         _set_text_if_changed(self.status_label, f"{quote.source} · {quote.quote_time}{time_label}\n{short_note}")
         self.status_label.setToolTip(f"{note}\n行情可能延迟，仅供参考，不作为交易依据")
+        self._paint_guard.request("detail_rendered")
         self.quote_loaded.emit(quote)
 
     @Slot(str)
@@ -3121,6 +3156,7 @@ class QuotePanel(QWidget):
         self.change_label.setText("")
         self.change_label.setStyleSheet("")
         self.status_label.setText(message)
+        self._paint_guard.request("detail_error")
 
     def _finish_loading(self) -> None:
         self._active_task = None
@@ -3155,6 +3191,7 @@ class StockPetWidget(QWidget):
 
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
+        self._paint_guard = WindowPaintGuard(self, "pet_bubble")
         self.settings = settings if settings is not None else QSettings()
         quote_source = str(self.settings.value("quote_source", "auto"))
         if quote_source not in HybridQuoteProvider.MODES:
@@ -3171,6 +3208,10 @@ class StockPetWidget(QWidget):
         self.panel.periodic_page_refresh_requested.connect(self.refresh_market_page_silent)
         self.panel.theme_changed.connect(self._on_bubble_theme_changed)
         self.panel.bubble_settings_changed.connect(self._apply_bubble_settings)
+        self.panel.us_overnight_bubble_changed.connect(self._apply_us_overnight_bubble)
+        self.show_us_overnight_bubble = _setting_bool(
+            self.settings.value(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False), default=False
+        )
         self.watchlist = list(self.panel.watchlist)
         self.favorite_symbols = list(self.panel.favorite_symbols)
         self.alert_threshold = self.panel.alert_threshold
@@ -3313,7 +3354,12 @@ class StockPetWidget(QWidget):
 
     def _set_pet_image(self, filename: str) -> None:
         pixmap = QPixmap(str(asset_path(filename)))
-        self.pet_label.setPixmap(pixmap.scaled(146, 146, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._set_pet_pixmap(pixmap.scaled(146, 146, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    @Slot(QPixmap)
+    def _set_pet_pixmap(self, pixmap: QPixmap) -> None:
+        self.pet_label.setPixmap(pixmap)
+        self._paint_guard.request("pet_frame", full=False)
 
     def set_skin(self, skin_key: str, persist: bool = True) -> None:
         if skin_key not in SKINS:
@@ -3336,7 +3382,7 @@ class StockPetWidget(QWidget):
                     random_idle=self.settings.value("pet_random_idle", True, type=bool),
                     parent=self,
                 )
-                self._animated_skin.frame_ready.connect(self.pet_label.setPixmap)
+                self._animated_skin.frame_ready.connect(self._set_pet_pixmap)
                 self._animated_skin.completed.connect(self._on_animated_cycle)
                 self._animated_skin.failed.connect(self._on_animated_skin_error, Qt.QueuedConnection)
                 self._animated_skin.set_animation(self._skin_animation)
@@ -3385,10 +3431,10 @@ class StockPetWidget(QWidget):
 
     def _render_skin_frame(self) -> None:
         if self._animated_skin is not None:
-            self.pet_label.setPixmap(self._animated_skin.render())
+            self._set_pet_pixmap(self._animated_skin.render())
             return
         if self._expression_skin is not None:
-            self.pet_label.setPixmap(self._expression_skin.render())
+            self._set_pet_pixmap(self._expression_skin.render())
             return
         if self._skin_sheet is None:
             return
@@ -3400,7 +3446,7 @@ class StockPetWidget(QWidget):
             SPRITE_CELL_WIDTH,
             SPRITE_CELL_HEIGHT,
         )
-        self.pet_label.setPixmap(
+        self._set_pet_pixmap(
             frame.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
 
@@ -3537,9 +3583,20 @@ class StockPetWidget(QWidget):
             )
             self._clamp_to_screen()
 
+    def _is_symbol_visible_in_bubble(self, raw_symbol: str) -> bool:
+        if not _is_visible_in_idle_bubble(raw_symbol):
+            return False
+        if not self.show_us_overnight_bubble and normalize_symbol(raw_symbol).market == "us":
+            session = us_session_at(close_grace=True)
+            # Hide regular-session fallback quotes too during the overnight
+            # window. This preference only filters presentation, not requests.
+            if session is not None and session.kind == "overnight":
+                return False
+        return True
+
     def _can_show_favorite_bubble(self) -> bool:
         return self.favorite_bubble_page_size > 0 and any(
-            _is_visible_in_idle_bubble(symbol) for symbol in self.favorite_symbols
+            self._is_symbol_visible_in_bubble(symbol) for symbol in self.favorite_symbols
         )
 
     def _show_favorite_prompt(self) -> None:
@@ -3566,7 +3623,9 @@ class StockPetWidget(QWidget):
         return [
             quote
             for quote in self._favorite_quotes
-            if _is_visible_in_idle_bubble(quote.symbol.code)
+            if self._is_symbol_visible_in_bubble(quote.symbol.code)
+            and (self.show_us_overnight_bubble
+                 or quote.symbol.market != "us" or quote.session != "overnight")
         ]
 
     def _set_bubble_quote(self, quote: Quote, *, favorite: bool = False) -> None:
@@ -3691,6 +3750,13 @@ class StockPetWidget(QWidget):
         else:
             self.refresh_favorites()
 
+    @Slot(bool)
+    def _apply_us_overnight_bubble(self, enabled: bool) -> None:
+        self.show_us_overnight_bubble = bool(enabled)
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, self.show_us_overnight_bubble)
+        self.settings.sync()
+        self._refresh_bubble_display()
+
     @Slot(int, int, int)
     def _apply_bubble_settings(
         self,
@@ -3723,6 +3789,9 @@ class StockPetWidget(QWidget):
             self.favorite_bubble_font_percent,
         )
         self.settings.sync()
+        self._refresh_bubble_display()
+
+    def _refresh_bubble_display(self) -> None:
         self._favorite_carousel_timer.stop()
         self._favorite_carousel_timer.setInterval(
             self.favorite_bubble_page_interval_seconds * 1_000
@@ -3735,6 +3804,8 @@ class StockPetWidget(QWidget):
             self._show_next_favorite()
             if self._favorite_page_count() > 1:
                 self._favorite_carousel_timer.start()
+        elif self._favorite_quotes:
+            self._hide_favorite_bubble()
         else:
             self._show_favorite_prompt()
 
@@ -3877,6 +3948,7 @@ class StockPetWidget(QWidget):
         )
         if self.bubble.styleSheet() != style:
             self.bubble.setStyleSheet(style)
+            self._paint_guard.request("bubble_theme")
 
     @Slot(str)
     def _on_bubble_theme_changed(self, theme: str) -> None:
