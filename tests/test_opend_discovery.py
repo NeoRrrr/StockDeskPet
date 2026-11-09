@@ -70,6 +70,34 @@ class OpenDDiscoveryTests(unittest.TestCase):
         self.assertEqual(self.probe.call_count, 2)
         self.futu.check_status.assert_called_once()
 
+    def test_health_check_recovers_before_negative_cache_expires_without_a_quote(self):
+        self.provider.fetch("01810")
+        generation = self.provider.generation
+        self.probe.return_value = True
+        self.now += 60
+        self.assertEqual(self.provider.check_opend_session(generation), (True, "OpenD ready", True))
+        self.assertEqual(self.provider.status_text(), "OpenD ready")
+        self.now += 60
+        self.assertEqual(self.provider.check_opend_session(generation), (True, "OpenD ready", False))
+        self.futu.fetch.assert_not_called()
+        self.assertEqual(self.tencent.fetch.call_count, 1)
+        self.assertEqual(self.provider.fetch("01810").source, "OpenD fixture")
+
+    def test_no_recovery_until_sdk_session_is_usable(self):
+        generation = self.provider.generation
+        self.probe.return_value = True
+        self.futu.check_status.return_value = (False, "未登录")
+        self.assertEqual(self.provider.check_opend_session(generation), (False, "未登录", False))
+        self.assertIn("腾讯", self.provider.fetch("01810").source)
+        self.futu.fetch.assert_not_called()
+        self.now += 60
+        self.futu.check_status.return_value = (True, "ready")
+        self.assertEqual(self.provider.check_opend_session(generation), (True, "ready", True))
+        self.probe.return_value = False
+        self.assertFalse(self.provider.check_opend_session(generation)[0])
+        self.probe.return_value = True
+        self.assertTrue(self.provider.check_opend_session(generation)[2])
+
     def test_manual_check_and_import_fail_fast_when_service_is_absent(self):
         ok, message = self.provider.check_futu_status()
         self.assertFalse(ok)

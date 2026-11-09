@@ -353,6 +353,7 @@ class HybridQuoteProvider:
         self._probe_lock = threading.Lock()
         self._opend_probe = opend_probe or is_opend_listening
         self._opend_available = False
+        self._session_ready = False  # Confirmed by the SDK, not just a listening port.
         self._probe_after = 0.0
         self.generation = 0
 
@@ -366,6 +367,8 @@ class HybridQuoteProvider:
             self.generation += 1
             self._retry_after = 0.0
             self._opend_available = False
+            self._session_ready = False
+            self._last_futu_error = "尚未检测 OpenD"
             self._probe_after = 0.0
             if mode == "tencent":
                 retired = self.futu
@@ -458,17 +461,41 @@ class HybridQuoteProvider:
         return self.tencent.search(query, limit=limit)
 
     def check_futu_status(self) -> tuple[bool, str]:
-        with self._state_lock:
-            futu, generation = self.futu, self.generation
-        if not self._can_retry_futu(futu, generation, force=True):
-            return False, self._probe_status_message(generation)
-        ok, message = futu.check_status()
-        with self._state_lock:
-            if generation == self.generation:
-                self._last_futu_error = message
-                if not ok:
-                    self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
+        ok, message, _ = self.check_opend_session(self.generation)
         return ok, message
+
+    def check_opend_session(self, generation: int) -> tuple[bool, str, bool]:
+        """Force a session check without publishing a positive TCP probe as recovery."""
+        with self._state_lock:
+            if generation != self.generation:
+                return False, "行情源已切换", False
+            futu = self.futu
+        # Serialize with demand-driven probes on the worker, never on the GUI thread.
+        with self._probe_lock:
+            with self._state_lock:
+                if generation != self.generation:
+                    return False, "行情源已切换", False
+            listening = self._opend_probe(getattr(futu, "host", "127.0.0.1"), getattr(futu, "port", 11111))
+            ok, message = False, "未检测到 OpenD 服务"
+            if listening:
+                with self._state_lock:
+                    if generation != self.generation:
+                        return False, "行情源已切换", False
+                try:
+                    ok, message = futu.check_status()
+                except Exception as exc:
+                    message = _friendly_futu_error(exc)
+            with self._state_lock:
+                if generation != self.generation:
+                    return False, "行情源已切换", False
+                recovered = ok and not self._session_ready
+                self._session_ready = ok
+                self._opend_available = ok
+                now = time.monotonic()
+                self._retry_after = now + FUTU_RETRY_SECONDS if listening and not ok else 0.0
+                self._probe_after = now + (OPEND_PRESENT_PROBE_SECONDS if listening else OPEND_ABSENT_PROBE_SECONDS)
+                self._last_futu_error = message
+                return ok, message, recovered
 
     def list_futu_watchlist_groups(self) -> list[str]:
         futu = self._available_futu_for_import()
@@ -492,7 +519,10 @@ class HybridQuoteProvider:
             return self._last_futu_error
 
     def close(self) -> None:
-        self.futu.close()
+        with self._state_lock:
+            self.generation += 1
+            futu = self.futu
+        futu.retire()  # Don't wait for SDK I/O on the GUI thread during exit.
 
     def _can_retry_futu(self, futu: FutuQuoteProvider, generation: int, *, force: bool = False) -> bool:
         now = time.monotonic()
@@ -529,7 +559,8 @@ class HybridQuoteProvider:
                 if force:
                     self._retry_after = 0.0
                 if not available:
-                    self._last_futu_error = "未检测到 OpenD 服务，已自动使用腾讯行情；5 分钟内不重复检测"
+                    self._session_ready = False
+                    self._last_futu_error = "未检测到 OpenD 服务，暂用腾讯行情"
             return available
         finally:
             self._probe_lock.release()
@@ -545,6 +576,7 @@ class HybridQuoteProvider:
     def _record_futu_success(self, generation: int) -> None:
         with self._state_lock:
             if generation == self.generation:
+                self._session_ready = True
                 self._last_futu_error = "OpenD 已连接，正在使用实时行情"
                 self._retry_after = 0.0
 
@@ -555,6 +587,7 @@ class HybridQuoteProvider:
                 self._last_futu_error = message
                 self._retry_after = time.monotonic() + FUTU_RETRY_SECONDS
                 self._opend_available = False
+                self._session_ready = False
                 self._probe_after = 0.0
         futu.close()
 

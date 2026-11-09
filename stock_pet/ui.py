@@ -415,14 +415,67 @@ class ProviderStatusTask(QRunnable):
     def __init__(self, provider: HybridQuoteProvider) -> None:
         super().__init__()
         self.provider = provider
+        self.generation = provider.generation
         self.signals = FetchSignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            self.signals.finished.emit(self.provider.check_futu_status())
+            result = self.provider.check_opend_session(self.generation)
         except Exception as exc:
-            self.signals.failed.emit(str(exc))
+            result = (False, str(exc), False)
+        self.signals.finished.emit((self.generation, *result))
+
+
+class OpenDMonitor(QObject):
+    checked = Signal(bool, str)
+    recovered = Signal()
+
+    def __init__(self, provider: HybridQuoteProvider, parent: QObject, *, periodic: bool = True):
+        super().__init__(parent)
+        self.provider = provider
+        self.periodic = periodic
+        self._task: ProviderStatusTask | None = None
+        self._stopped = False
+        self.timer = QTimer(self)
+        self.timer.setInterval(60_000)
+        self.timer.timeout.connect(self._tick)
+        self.configure()
+
+    def configure(self) -> None:
+        if self.periodic and not self._stopped and self.provider.mode == "auto":
+            self.timer.start()
+        else:
+            self.timer.stop()
+
+    @Slot()
+    def _tick(self) -> None:
+        if self.provider.mode == "auto":
+            self.request()
+
+    def request(self) -> None:
+        if self._stopped or (self._task and self._task.generation == self.provider.generation):
+            return
+        task = ProviderStatusTask(self.provider)
+        task.signals.finished.connect(self._on_checked)
+        self._task = task
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(object)
+    def _on_checked(self, result) -> None:
+        generation, ok, message, recovered = result
+        if self._task is None or self._task.generation != generation:
+            return
+        self._task = None
+        if self._stopped or self.provider.generation != generation:
+            return
+        self.checked.emit(ok, message)
+        if recovered and self.provider.mode == "auto":
+            self.recovered.emit()
+
+    def stop(self) -> None:
+        self._stopped = True
+        self.timer.stop()
 
 
 class FutuWatchlistTask(QRunnable):
@@ -1355,12 +1408,15 @@ class SettingsDialog(QDialog):
         provider: HybridQuoteProvider,
         theme: str = "dark",
         parent: QWidget | None = None,
+        monitor: OpenDMonitor | None = None,
     ) -> None:
         super().__init__(parent)
         _load_ui_fonts()
         self.settings = settings
         self.provider = provider
-        self._provider_status_task: ProviderStatusTask | None = None
+        self._monitor = monitor or OpenDMonitor(provider, self, periodic=False)
+        self._monitor.checked.connect(self._on_provider_status)
+        self.finished.connect(self._detach_monitor)
         self._update_task: UpdateCheckTask | None = None
         self._release_url = f"{PROJECT_URL}/releases"
         self.setWindowTitle("设置")
@@ -1396,6 +1452,7 @@ class SettingsDialog(QDialog):
         saved_index = self.quote_source_combo.findData(saved_mode)
         self.quote_source_combo.setCurrentIndex(max(0, saved_index))
         self.check_provider_button = QPushButton("检测 OpenD")
+        self.check_provider_button.setToolTip("富途实时优先模式每分钟在后台检测一次，也可点击立即检测")
         self.check_provider_button.setObjectName("secondaryButton")
         self.check_provider_button.clicked.connect(self.check_provider_status)
         source_row.addWidget(self.quote_source_combo, 1)
@@ -1719,6 +1776,8 @@ class SettingsDialog(QDialog):
         self.settings.setValue("quote_source", mode)
         self.settings.sync()
         self.provider.set_mode(mode)
+        self._monitor.configure()
+        self._finish_provider_status_check()
         if mode == "tencent":
             self.provider_status.setText("当前使用腾讯公共行情；港股可能延迟约 15 分钟")
         else:
@@ -1726,30 +1785,21 @@ class SettingsDialog(QDialog):
 
     @Slot()
     def check_provider_status(self) -> None:
-        if self._provider_status_task is not None:
-            return
         self.check_provider_button.setDisabled(True)
         self.check_provider_button.setText("检测中…")
         self.provider_status.setText("正在连接本机 127.0.0.1:11111…")
-        task = ProviderStatusTask(self.provider)
-        task.signals.finished.connect(self._on_provider_status)
-        task.signals.failed.connect(self._on_provider_status_error)
-        self._provider_status_task = task
-        QThreadPool.globalInstance().start(task)
+        self._monitor.request()
 
-    @Slot(object)
-    def _on_provider_status(self, result: tuple[bool, str]) -> None:
-        ok, message = result
+    @Slot(bool, str)
+    def _on_provider_status(self, ok: bool, message: str) -> None:
         self._finish_provider_status_check()
         self.provider_status.setText(("✓ " if ok else "! ") + message)
 
-    @Slot(str)
-    def _on_provider_status_error(self, message: str) -> None:
-        self._finish_provider_status_check()
-        self.provider_status.setText(f"! {message}")
+    @Slot(int)
+    def _detach_monitor(self, _result: int) -> None:
+        self._monitor.checked.disconnect(self._on_provider_status)
 
     def _finish_provider_status_check(self) -> None:
-        self._provider_status_task = None
         self.check_provider_button.setDisabled(False)
         self.check_provider_button.setText("检测 OpenD")
 
@@ -1836,6 +1886,7 @@ class QuotePanel(QWidget):
         self.provider = provider
         self.settings = settings
         self.thread_pool = QThreadPool.globalInstance()
+        self.opend_monitor = OpenDMonitor(provider, self) if isinstance(provider, HybridQuoteProvider) else None
         self._active_task: FetchTask | None = None
         self._pending_fetch_symbol: str | None = None
         self._search_task: SearchTask | None = None
@@ -2912,6 +2963,7 @@ class QuotePanel(QWidget):
             self.provider,
             theme=self.current_theme,
             parent=self,
+            monitor=self.opend_monitor,
         )
         dialog.bubble_settings_changed.connect(
             lambda page_size, interval_seconds, font_percent: self.bubble_settings_changed.emit(
@@ -3199,6 +3251,8 @@ class StockPetWidget(QWidget):
         self.settings.setValue("quote_source", quote_source)
         self.provider = HybridQuoteProvider(mode=quote_source)
         self.panel = QuotePanel(self.provider, self.settings)
+        self._opend_refresh_generation: int | None = None
+        self.panel.opend_monitor.recovered.connect(self._on_opend_recovered)
         self.panel.quote_loaded.connect(self._apply_quote)
         self.panel.quotes_updated.connect(self._sync_favorite_quotes)
         self.panel.loading_changed.connect(self._loading_changed)
@@ -3350,7 +3404,36 @@ class StockPetWidget(QWidget):
 
     @Slot()
     def close_provider(self) -> None:
+        self.panel.opend_monitor.stop()
+        self._opend_refresh_generation = None
         self.provider.close()
+
+    @Slot()
+    def _on_opend_recovered(self) -> None:
+        self._opend_refresh_generation = self.provider.generation
+        self._refresh_recovered_source()
+
+    def _refresh_recovered_source(self) -> None:
+        # Coalesce behind an in-flight batch, using the current tab when it finishes.
+        if self._opend_refresh_generation is None or self._watch_task is not None:
+            return
+        generation, self._opend_refresh_generation = self._opend_refresh_generation, None
+        if generation != self.provider.generation or self.provider.mode != "auto":
+            return
+        symbols = list(self.favorite_symbols)
+        if self.panel.isVisible():
+            symbols.extend(self.panel._current_tab_refresh_symbols())
+            symbols.append(self.panel._current_input_symbol())
+        supported = []
+        for code in dict.fromkeys(symbols):
+            try:
+                symbol = normalize_symbol(code)
+            except SymbolError:
+                continue
+            if self.provider.futu.supports(symbol):
+                supported.append(symbol.code)
+        if supported:
+            self.refresh_market_page_silent(supported)
 
     def _set_pet_image(self, filename: str) -> None:
         pixmap = QPixmap(str(asset_path(filename)))
@@ -4119,6 +4202,8 @@ class StockPetWidget(QWidget):
                 QTimer.singleShot(0, lambda: self.refresh_market_page(symbols))
             else:
                 QTimer.singleShot(0, lambda: self.refresh_market_page_silent(requested_symbols))
+            if self._opend_refresh_generation is not None:
+                QTimer.singleShot(0, self._refresh_recovered_source)
             return
         self._record_initial_refresh_result(
             requested_symbols, quotes, self._page_refresh_initialized_keys,
@@ -4139,6 +4224,8 @@ class StockPetWidget(QWidget):
                 0,
                 lambda symbols=pending_symbols: self.refresh_market_page(symbols),
             )
+        else:
+            self._refresh_recovered_source()
 
         if not self.alerts_enabled:
             return

@@ -20,7 +20,7 @@ from stock_pet.hybrid_quote_provider import FutuQuoteProvider, HybridQuoteProvid
 from stock_pet.models import Quote, quote_is_older
 from stock_pet.quote_provider import QuoteError, TencentQuoteProvider
 from stock_pet.symbols import normalize_symbol
-from stock_pet.ui import QuotePanel, StockPetWidget, WatchlistTask
+from stock_pet.ui import QuotePanel, SettingsDialog, StockPetWidget, WatchlistTask
 
 
 def quote(code="01810", price=40, stamp="2026-11-03 14:00:00"):
@@ -184,6 +184,67 @@ class QuoteRefreshUiTests(unittest.TestCase):
     def page_result(self, quotes):
         self.pet._watch_task = WatchlistTask(self.pet.provider, ["01810"])
         self.pet._on_watchlist_result((quotes, []))
+
+    def test_hidden_panel_minute_check_and_manual_check_share_one_task(self):
+        monitor, provider = self.panel.opend_monitor, self.pet.provider
+        dialog = SettingsDialog(self.panel.settings, provider, parent=self.panel, monitor=monitor)
+        self.addCleanup(dialog.reject)
+        self.assertFalse(self.panel.isVisible())
+        self.assertFalse(monitor.timer.isActive())
+        dialog.quote_source_combo.setCurrentIndex(dialog.quote_source_combo.findData("auto"))
+        self.assertTrue(monitor.timer.isActive())
+        self.assertEqual(monitor.timer.interval(), 60_000)
+        pool = QThreadPool.globalInstance()
+        pool.start.reset_mock()
+        with patch.object(provider, "_opend_probe", return_value=True), \
+             patch.object(provider.futu, "check_status", return_value=(True, "fixture ready")), \
+             patch.object(self.pet, "refresh_market_page_silent") as refresh:
+            monitor.timer.timeout.emit()
+            dialog.check_provider_status()
+            monitor.timer.timeout.emit()
+            pool.start.assert_called_once()
+            pool.start.call_args.args[0].run()
+            refresh.assert_called_once_with(["01810"])
+            self.assertIn("fixture ready", dialog.provider_status.text())
+            self.assertTrue(dialog.check_provider_button.isEnabled())
+            monitor.timer.timeout.emit()
+            pool.start.call_args.args[0].run()
+            refresh.assert_called_once()
+
+    def test_tencent_mode_cancels_timer_and_ignores_old_worker(self):
+        monitor, provider = self.panel.opend_monitor, self.pet.provider
+        dialog = SettingsDialog(self.panel.settings, provider, parent=self.panel, monitor=monitor)
+        self.addCleanup(dialog.reject)
+        combo = dialog.quote_source_combo
+        combo.setCurrentIndex(combo.findData("auto"))
+        monitor.timer.timeout.emit()
+        task = QThreadPool.globalInstance().start.call_args.args[0]
+        combo.setCurrentIndex(combo.findData("tencent"))
+        self.assertFalse(monitor.timer.isActive())
+        with patch.object(self.pet, "refresh_market_page_silent") as refresh, \
+             patch.object(provider, "_opend_probe") as probe:
+            QThreadPool.globalInstance().start.reset_mock()
+            monitor.timer.timeout.emit()
+            QThreadPool.globalInstance().start.assert_not_called()
+            task.run()
+            probe.assert_not_called()
+            refresh.assert_not_called()
+            self.assertIn("腾讯", dialog.provider_status.text())
+
+    def test_recovery_during_page_fetch_refreshes_latest_visible_selection_once(self):
+        provider = self.pet.provider
+        provider.set_mode("auto")
+        self.pet._watch_task = WatchlistTask(provider, ["01810"])
+        with patch.object(self.panel, "isVisible", return_value=True), \
+             patch.object(self.panel, "_current_tab_refresh_symbols", return_value=["01810", "GOLD", "159516"]), \
+             patch.object(self.panel, "_current_input_symbol", return_value="US.NVDA"), \
+             patch.object(self.pet, "refresh_market_page_silent") as refresh:
+            self.panel.opend_monitor.recovered.emit()
+            refresh.assert_not_called()
+            self.pet._on_watchlist_result(([], []))
+            refresh.assert_called_once_with(["01810", "159516", "US.NVDA"])
+            self.pet._refresh_recovered_source()
+            refresh.assert_called_once()
 
     def test_late_page_cannot_rewind_favorites_detail_or_alerts(self):
         newest = quote(price=41, stamp="2026-11-03 14:00:10")
