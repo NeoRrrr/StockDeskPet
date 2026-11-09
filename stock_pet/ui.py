@@ -124,9 +124,10 @@ FAVORITE_BUBBLE_FONT_MAX_PERCENT = 150
 FAVORITE_BUBBLE_FONT_SETTINGS_KEY = "favorite_bubble_font_percent"
 US_OVERNIGHT_BUBBLE_SETTINGS_KEY = "show_us_overnight_bubble"  # Legacy checkbox.
 US_OVERNIGHT_BUBBLE_MODE_KEY = "us_overnight_bubble_mode"
+US_OVERNIGHT_BUBBLE_START_HOURS = {"after_15": 15, "after_16": 16}
 US_OVERNIGHT_BUBBLE_MODES = {
     "off": "不显示",
-    "after_16": "仅北京时间 16:00 后显示",
+    **{mode: f"仅北京时间 {hour}:00 后显示" for mode, hour in US_OVERNIGHT_BUBBLE_START_HOURS.items()},
     "all": "整个夜盘都显示",
 }
 INITIAL_QUOTE_RETRY_SECONDS = 30
@@ -1595,7 +1596,7 @@ class SettingsDialog(QDialog):
             self.us_overnight_bubble_combo.findData(_read_overnight_bubble_mode(settings))
         )
         self.us_overnight_bubble_combo.setToolTip(
-            "16:00 按北京时间计算，仅在美股仍处于夜盘时显示。"
+            "15:00 和 16:00 均按北京时间计算，从所选时间起显示至当次美股夜盘结束。"
             "盘前、盘中、盘后气泡及行情卡、刷新、提醒均不受影响。"
         )
         self.us_overnight_bubble_combo.currentIndexChanged.connect(self._on_us_overnight_bubble_changed)
@@ -3700,7 +3701,8 @@ class StockPetWidget(QWidget):
         if not in_overnight:
             return quote_session != "overnight"  # Don't carry a cached night quote into pre-market.
         # Apply the same gate to Tencent fallback quotes and the loading prompt.
-        return mode == "after_16" and now.astimezone(MARKET_TIMEZONE).hour >= 16
+        start_hour = US_OVERNIGHT_BUBBLE_START_HOURS.get(mode)
+        return start_hour is not None and now.astimezone(MARKET_TIMEZONE).hour >= start_hour
 
     def _can_show_favorite_bubble(self) -> bool:
         return self.favorite_bubble_page_size > 0 and any(

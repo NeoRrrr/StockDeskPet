@@ -308,7 +308,7 @@ class ExtendedUITests(unittest.TestCase):
         dialog = SettingsDialog(self.settings, pet.provider)
         self.addCleanup(self.close_widget, dialog)
         combo = dialog.us_overnight_bubble_combo
-        self.assertEqual([combo.itemData(i) for i in range(combo.count())], ["off", "after_16", "all"])
+        self.assertEqual([combo.itemData(i) for i in range(combo.count())], ["off", "after_15", "after_16", "all"])
         self.assertEqual(combo.currentData(), "off")
         changes = []
         dialog.us_overnight_bubble_changed.connect(changes.append)
@@ -321,6 +321,8 @@ class ExtendedUITests(unittest.TestCase):
         combo = restored.us_overnight_bubble_combo
         self.assertEqual(combo.currentData(), "after_16")
         self.assertEqual(self.make_pet().us_overnight_bubble_mode, "after_16")
+        combo.setCurrentIndex(combo.findData("after_15"))
+        self.assertEqual(self.make_pet().us_overnight_bubble_mode, "after_15")
         combo.setCurrentIndex(combo.findData("all"))
         self.assertEqual(self.make_pet().us_overnight_bubble_mode, "all")
         combo.setCurrentIndex(combo.findData("off"))
@@ -381,6 +383,25 @@ class ExtendedUITests(unittest.TestCase):
             pet._favorite_quotes = [replace(night_quote(), session="regular")]
             pet._show_next_favorite()
             self.assertTrue(pet.bubble.isHidden())
+
+    def test_after_15_opens_at_beijing_cutoff_in_both_seasons(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_MODE_KEY, "after_15")
+        pet = self.make_pet()
+        pet._favorite_quotes = [night_quote()]
+        for before, opening, pre in (
+            ("2026-07-08 02:59:59", "2026-07-08 03:00:00", "2026-07-08 04:00:00"),
+            ("2026-11-04 01:59:59", "2026-11-04 02:00:00", "2026-11-04 04:00:00"),
+        ):
+            with self.subTest(before=before), self.at_session_time(before):
+                pet._show_next_favorite()
+                self.assertTrue(pet.bubble.isHidden())
+            with self.subTest(opening=opening), self.at_session_time(opening):
+                pet.refresh_favorites()
+                self.assertFalse(pet.bubble.isHidden())
+                self.assertIn("英伟达", pet.bubble.text())
+            with self.subTest(pre=pre), self.at_session_time(pre):
+                self.assertFalse(pet._is_symbol_visible_in_bubble("US.NVDA", "overnight"))
+                self.assertTrue(pet._is_symbol_visible_in_bubble("US.NVDA", "pre"))
 
     def test_after_16_appears_from_cache_at_beijing_cutoff_during_winter_overnight(self):
         self.settings.setValue(US_OVERNIGHT_BUBBLE_MODE_KEY, "after_16")
