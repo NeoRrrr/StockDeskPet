@@ -20,7 +20,7 @@ from stock_pet.models import quote_is_older, quote_session_label, us_quote_is_cu
 from stock_pet.symbols import normalize_symbol
 from stock_pet.ui import (
     QuotePanel, SettingsDialog, StockPetWidget, US_DEFAULTS_SETTINGS_KEY,
-    US_OVERNIGHT_BUBBLE_SETTINGS_KEY,
+    US_OVERNIGHT_BUBBLE_MODE_KEY, US_OVERNIGHT_BUBBLE_SETTINGS_KEY,
     _is_open_for_automatic_refresh, _is_visible_in_idle_bubble,
 )
 from stock_pet.quote_provider import TencentQuoteProvider
@@ -289,6 +289,7 @@ class ExtendedUITests(unittest.TestCase):
     def at_session_time(self, text):
         now = et(text)
         stack = ExitStack()
+        stack.enter_context(patch("stock_pet.ui.us_now", return_value=now))
         stack.enter_context(patch("stock_pet.ui.us_session_at", return_value=us_session_at(now, close_grace=True)))
         stack.enter_context(patch("stock_pet.models.us_now", return_value=now))
         stack.enter_context(patch("stock_pet.ui._is_visible_in_idle_bubble",
@@ -300,25 +301,30 @@ class ExtendedUITests(unittest.TestCase):
         self.addCleanup(self.close_widget, pet)
         return pet
 
-    def test_overnight_checkbox_defaults_off_and_remembers_explicit_choices(self):
+    def test_overnight_dropdown_defaults_off_and_remembers_explicit_choices(self):
         self.settings.remove(US_OVERNIGHT_BUBBLE_SETTINGS_KEY)
         pet = self.make_pet()
-        self.assertFalse(pet.show_us_overnight_bubble)
+        self.assertEqual(pet.us_overnight_bubble_mode, "off")
         dialog = SettingsDialog(self.settings, pet.provider)
         self.addCleanup(self.close_widget, dialog)
-        self.assertFalse(dialog.us_overnight_bubble_checkbox.isChecked())
+        combo = dialog.us_overnight_bubble_combo
+        self.assertEqual([combo.itemData(i) for i in range(combo.count())], ["off", "after_16", "all"])
+        self.assertEqual(combo.currentData(), "off")
         changes = []
         dialog.us_overnight_bubble_changed.connect(changes.append)
-        dialog.us_overnight_bubble_checkbox.setChecked(True)
-        self.assertEqual(changes, [True])
+        combo.setCurrentIndex(combo.findData("after_16"))
+        self.assertEqual(changes, ["after_16"])
         # Exercise persisted INI values and a new application instance.
         reloaded = QSettings(self.settings.fileName(), QSettings.IniFormat)
         restored = SettingsDialog(reloaded, pet.provider, theme="beige")
         self.addCleanup(self.close_widget, restored)
-        self.assertTrue(restored.us_overnight_bubble_checkbox.isChecked())
-        self.assertTrue(self.make_pet().show_us_overnight_bubble)
-        restored.us_overnight_bubble_checkbox.setChecked(False)
-        self.assertFalse(self.make_pet().show_us_overnight_bubble)
+        combo = restored.us_overnight_bubble_combo
+        self.assertEqual(combo.currentData(), "after_16")
+        self.assertEqual(self.make_pet().us_overnight_bubble_mode, "after_16")
+        combo.setCurrentIndex(combo.findData("all"))
+        self.assertEqual(self.make_pet().us_overnight_bubble_mode, "all")
+        combo.setCurrentIndex(combo.findData("off"))
+        self.assertEqual(self.make_pet().us_overnight_bubble_mode, "off")
 
     def test_settings_signal_hides_only_bubble_immediately_without_fetching(self):
         pet = self.make_pet()
@@ -333,7 +339,9 @@ class ExtendedUITests(unittest.TestCase):
 
             def toggle_in_dialog(dialog):
                 self.addCleanup(self.close_widget, dialog)
-                dialog.us_overnight_bubble_checkbox.setChecked(False)
+                combo = dialog.us_overnight_bubble_combo
+                self.assertEqual(combo.currentData(), "all")  # The legacy checkbox was enabled.
+                combo.setCurrentIndex(combo.findData("off"))
                 self.assertTrue(pet.bubble.isHidden())
                 return 0
 
@@ -342,7 +350,7 @@ class ExtendedUITests(unittest.TestCase):
             ) as fetch:
                 pet.panel.open_settings()
                 fetch.assert_not_called()
-            self.assertFalse(pet.show_us_overnight_bubble)
+            self.assertEqual(pet.us_overnight_bubble_mode, "off")
             self.assertFalse(pet._favorite_carousel_timer.isActive())
             self.assertEqual(pet.panel.price_label.text(), detail)
             self.assertIn("夜盘", pet.panel.name_label.text())
@@ -350,7 +358,7 @@ class ExtendedUITests(unittest.TestCase):
             self.assertEqual(pet._favorite_quotes, [quote])
             self.assertEqual(pet._favorite_refresh_timer.interval(), timer_interval)
             self.assertTrue(pet.alerts_enabled)
-            pet._apply_us_overnight_bubble(True)
+            pet._apply_us_overnight_bubble("all")
             self.assertFalse(pet.bubble.isHidden())
             self.assertIn("英伟达", pet.bubble.text())
 
@@ -374,6 +382,41 @@ class ExtendedUITests(unittest.TestCase):
             pet._show_next_favorite()
             self.assertTrue(pet.bubble.isHidden())
 
+    def test_after_16_appears_from_cache_at_beijing_cutoff_during_winter_overnight(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_MODE_KEY, "after_16")
+        pet = self.make_pet()
+        night = night_quote()
+        with self.at_session_time("2026-11-04 02:59:59"):  # Beijing 15:59:59
+            pet._show_favorite_prompt()
+            self.assertTrue(pet.bubble.isHidden())
+            pet.refresh_favorites()
+            self.assertEqual(pet._favorite_task.symbols, ["US.NVDA"])
+            pet._on_favorite_result(([night], []))
+            self.assertTrue(pet.bubble.isHidden())
+            self.assertIn("usNVDA", pet.panel._quote_cache)
+        with self.at_session_time("2026-11-04 03:00:00"):  # Beijing 16:00:00
+            pet.refresh_favorites()  # No network reply needed to redisplay the cached quote.
+            self.assertFalse(pet.bubble.isHidden())
+            self.assertIn("英伟达", pet.bubble.text())
+        with self.at_session_time("2026-11-04 04:00:00"):  # Beijing 17:00: pre-market.
+            pet.refresh_favorites()
+            self.assertTrue(pet.bubble.isHidden())
+            pet._on_favorite_result(([replace(night, session="pre", quote_time="2026-11-04 04:00:00")], []))
+            self.assertFalse(pet.bubble.isHidden())
+
+    def test_after_16_summer_has_no_overnight_overlap_and_does_not_hide_premarket(self):
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_MODE_KEY, "after_16")
+        pet = self.make_pet()
+        night = night_quote()
+        with self.at_session_time("2026-07-08 03:59:59"):  # Beijing 15:59:59
+            pet._favorite_quotes = [replace(night, session="regular")]
+            pet._show_next_favorite()
+            self.assertTrue(pet.bubble.isHidden())  # A Tencent fallback can't bypass the time gate.
+            self.assertTrue(pet._is_symbol_visible_in_bubble("01810"))
+        with self.at_session_time("2026-07-08 04:00:00"):  # Beijing 16:00, already pre-market
+            self.assertFalse(pet._is_symbol_visible_in_bubble("US.NVDA", "overnight"))
+            self.assertTrue(pet._is_symbol_visible_in_bubble("US.NVDA", "pre"))
+
     def test_overnight_filter_keeps_other_markets_and_repaginates(self):
         self.settings.setValue("favorites", ["US.NVDA", "01810", "GOLD"])
         pet = self.make_pet()
@@ -385,7 +428,7 @@ class ExtendedUITests(unittest.TestCase):
             pet._apply_bubble_settings(1, 10, 100)
             self.assertEqual(pet._favorite_page_count(), 3)
             pet._favorite_index = 2
-            pet._apply_us_overnight_bubble(False)
+            pet._apply_us_overnight_bubble("off")
             self.assertEqual(pet._visible_favorite_quotes(), [hk, gold])
             self.assertEqual(pet._favorite_page_count(), 2)
             self.assertTrue(pet._favorite_carousel_timer.isActive())
@@ -431,8 +474,8 @@ class ExtendedUITests(unittest.TestCase):
         with self.at_session_time("2026-11-04 01:01:01"):
             pet._favorite_quotes = [night_quote()]
             pet._apply_bubble_settings(0, 10, 100)
-            pet._apply_us_overnight_bubble(False)
-            pet._apply_us_overnight_bubble(True)
+            pet._apply_us_overnight_bubble("off")
+            pet._apply_us_overnight_bubble("all")
             self.assertTrue(pet.bubble.isHidden())
             self.assertFalse(pet._favorite_carousel_timer.isActive())
 

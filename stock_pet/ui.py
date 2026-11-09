@@ -57,7 +57,7 @@ from .update_checker import (
     AutomaticUpdateResult,
     check_download_and_install,
 )
-from .us_sessions import us_session_at
+from .us_sessions import us_now, us_session_at
 
 
 SPRITE_CELL_WIDTH = 192
@@ -122,7 +122,13 @@ FAVORITE_BUBBLE_FONT_PERCENT = 100
 FAVORITE_BUBBLE_FONT_MIN_PERCENT = 80
 FAVORITE_BUBBLE_FONT_MAX_PERCENT = 150
 FAVORITE_BUBBLE_FONT_SETTINGS_KEY = "favorite_bubble_font_percent"
-US_OVERNIGHT_BUBBLE_SETTINGS_KEY = "show_us_overnight_bubble"
+US_OVERNIGHT_BUBBLE_SETTINGS_KEY = "show_us_overnight_bubble"  # Legacy checkbox.
+US_OVERNIGHT_BUBBLE_MODE_KEY = "us_overnight_bubble_mode"
+US_OVERNIGHT_BUBBLE_MODES = {
+    "off": "不显示",
+    "after_16": "仅北京时间 16:00 后显示",
+    "all": "整个夜盘都显示",
+}
 INITIAL_QUOTE_RETRY_SECONDS = 30
 INITIAL_QUOTE_RETRY_MAX_SECONDS = 300
 ALERT_REARM_MARGIN_PERCENT = 0.2
@@ -267,6 +273,13 @@ def _setting_bool(value: object, default: bool = True) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_overnight_bubble_mode(settings: QSettings) -> str:
+    if settings.contains(US_OVERNIGHT_BUBBLE_MODE_KEY):
+        mode = str(settings.value(US_OVERNIGHT_BUBBLE_MODE_KEY))
+        return mode if mode in US_OVERNIGHT_BUBBLE_MODES else "off"
+    return "all" if _setting_bool(settings.value(US_OVERNIGHT_BUBBLE_SETTINGS_KEY), default=False) else "off"
 
 
 def _settings_list(settings: QSettings, key: str) -> list[str]:
@@ -1400,7 +1413,7 @@ class WatchlistDialog(QDialog):
 
 class SettingsDialog(QDialog):
     bubble_settings_changed = Signal(int, int, int)
-    us_overnight_bubble_changed = Signal(bool)
+    us_overnight_bubble_changed = Signal(str)
 
     def __init__(
         self,
@@ -1571,16 +1584,24 @@ class SettingsDialog(QDialog):
         font_row.addWidget(self.bubble_font_value)
         bubble_layout.addLayout(font_row)
 
-        self.us_overnight_bubble_checkbox = QCheckBox("显示美股夜盘（仅气泡）")
-        self.us_overnight_bubble_checkbox.setChecked(
-            _setting_bool(settings.value(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False), default=False)
+        night_row = QHBoxLayout()
+        night_label = QLabel("美股夜盘气泡")
+        self.us_overnight_bubble_combo = QComboBox()
+        night_label.setBuddy(self.us_overnight_bubble_combo)
+        self.us_overnight_bubble_combo.setAccessibleName(night_label.text())
+        for mode, label in US_OVERNIGHT_BUBBLE_MODES.items():
+            self.us_overnight_bubble_combo.addItem(label, mode)
+        self.us_overnight_bubble_combo.setCurrentIndex(
+            self.us_overnight_bubble_combo.findData(_read_overnight_bubble_mode(settings))
         )
-        self.us_overnight_bubble_checkbox.setToolTip(
-            "关闭后隐藏美股夜盘气泡；行情卡、行情刷新和系统提醒不受影响。"
-            "盘前、盘中、盘后气泡仍按原规则显示。"
+        self.us_overnight_bubble_combo.setToolTip(
+            "16:00 按北京时间计算，仅在美股仍处于夜盘时显示。"
+            "盘前、盘中、盘后气泡及行情卡、刷新、提醒均不受影响。"
         )
-        self.us_overnight_bubble_checkbox.toggled.connect(self._on_us_overnight_bubble_changed)
-        bubble_layout.addWidget(self.us_overnight_bubble_checkbox)
+        self.us_overnight_bubble_combo.currentIndexChanged.connect(self._on_us_overnight_bubble_changed)
+        night_row.addWidget(night_label)
+        night_row.addWidget(self.us_overnight_bubble_combo, 1)
+        bubble_layout.addLayout(night_row)
 
         settings.setValue(FAVORITE_BUBBLE_PAGE_SIZE_SETTINGS_KEY, saved_page_size)
         settings.setValue(
@@ -1676,13 +1697,13 @@ class SettingsDialog(QDialog):
                 width: 14px; margin: -5px 0; background: #ffffff;
                 border: 1px solid #397bec; border-radius: 7px;
             }
-            QComboBox#quoteSourceCombo {
+            QComboBox {
                 color: #e4edf7; background: #0c1622; border: 1px solid #32445b;
                 border-radius: 8px; padding: 7px 10px; min-height: 18px;
             }
-            QComboBox#quoteSourceCombo:hover, QComboBox#quoteSourceCombo:focus { border-color: #4b83e3; }
-            QComboBox#quoteSourceCombo::drop-down { border: 0; width: 24px; }
-            QComboBox#quoteSourceCombo QAbstractItemView {
+            QComboBox:hover, QComboBox:focus { border-color: #4b83e3; }
+            QComboBox::drop-down { border: 0; width: 24px; }
+            QComboBox QAbstractItemView {
                 color: #e4edf7; background: #101b28; border: 1px solid #32445b;
                 selection-background-color: #2467d8;
             }
@@ -1726,11 +1747,11 @@ class SettingsDialog(QDialog):
                 QSlider#bubbleFontSlider::handle:horizontal {
                     background: #ffffff; border-color: #2d6ed8;
                 }
-                QComboBox#quoteSourceCombo {
+                QComboBox {
                     color: #243247; background: #ffffff; border-color: #c6d2e1;
                 }
-                QComboBox#quoteSourceCombo:hover, QComboBox#quoteSourceCombo:focus { border-color: #6b97dc; }
-                QComboBox#quoteSourceCombo QAbstractItemView {
+                QComboBox:hover, QComboBox:focus { border-color: #6b97dc; }
+                QComboBox QAbstractItemView {
                     color: #243247; background: #ffffff; border-color: #c6d2e1;
                     selection-background-color: #2d6ed8;
                 }
@@ -1747,11 +1768,14 @@ class SettingsDialog(QDialog):
             """
         self.setStyleSheet(stylesheet)
 
-    @Slot(bool)
-    def _on_us_overnight_bubble_changed(self, enabled: bool) -> None:
-        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, enabled)
+    @Slot(int)
+    def _on_us_overnight_bubble_changed(self, index: int) -> None:
+        mode = self.us_overnight_bubble_combo.itemData(index)
+        if mode not in US_OVERNIGHT_BUBBLE_MODES:
+            return
+        self.settings.setValue(US_OVERNIGHT_BUBBLE_MODE_KEY, mode)
         self.settings.sync()
-        self.us_overnight_bubble_changed.emit(enabled)
+        self.us_overnight_bubble_changed.emit(mode)
 
     @Slot(int)
     def _on_bubble_settings_changed(self, _value: int) -> None:
@@ -1877,7 +1901,7 @@ class QuotePanel(QWidget):
     periodic_page_refresh_requested = Signal(object)
     theme_changed = Signal(str)
     bubble_settings_changed = Signal(int, int, int)
-    us_overnight_bubble_changed = Signal(bool)
+    us_overnight_bubble_changed = Signal(str)
 
     def __init__(self, provider: TencentQuoteProvider, settings: QSettings) -> None:
         super().__init__()
@@ -3263,9 +3287,7 @@ class StockPetWidget(QWidget):
         self.panel.theme_changed.connect(self._on_bubble_theme_changed)
         self.panel.bubble_settings_changed.connect(self._apply_bubble_settings)
         self.panel.us_overnight_bubble_changed.connect(self._apply_us_overnight_bubble)
-        self.show_us_overnight_bubble = _setting_bool(
-            self.settings.value(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, False), default=False
-        )
+        self.us_overnight_bubble_mode = _read_overnight_bubble_mode(self.settings)
         self.watchlist = list(self.panel.watchlist)
         self.favorite_symbols = list(self.panel.favorite_symbols)
         self.alert_threshold = self.panel.alert_threshold
@@ -3666,16 +3688,19 @@ class StockPetWidget(QWidget):
             )
             self._clamp_to_screen()
 
-    def _is_symbol_visible_in_bubble(self, raw_symbol: str) -> bool:
+    def _is_symbol_visible_in_bubble(self, raw_symbol: str, quote_session: str = "") -> bool:
         if not _is_visible_in_idle_bubble(raw_symbol):
             return False
-        if not self.show_us_overnight_bubble and normalize_symbol(raw_symbol).market == "us":
-            session = us_session_at(close_grace=True)
-            # Hide regular-session fallback quotes too during the overnight
-            # window. This preference only filters presentation, not requests.
-            if session is not None and session.kind == "overnight":
-                return False
-        return True
+        mode = self.us_overnight_bubble_mode
+        if mode == "all" or normalize_symbol(raw_symbol).market != "us":
+            return True
+        now = us_now()
+        session = us_session_at(now, close_grace=True)
+        in_overnight = session is not None and session.kind == "overnight"
+        if not in_overnight:
+            return quote_session != "overnight"  # Don't carry a cached night quote into pre-market.
+        # Apply the same gate to Tencent fallback quotes and the loading prompt.
+        return mode == "after_16" and now.astimezone(MARKET_TIMEZONE).hour >= 16
 
     def _can_show_favorite_bubble(self) -> bool:
         return self.favorite_bubble_page_size > 0 and any(
@@ -3706,9 +3731,7 @@ class StockPetWidget(QWidget):
         return [
             quote
             for quote in self._favorite_quotes
-            if self._is_symbol_visible_in_bubble(quote.symbol.code)
-            and (self.show_us_overnight_bubble
-                 or quote.symbol.market != "us" or quote.session != "overnight")
+            if self._is_symbol_visible_in_bubble(quote.symbol.code, quote.session)
         ]
 
     def _set_bubble_quote(self, quote: Quote, *, favorite: bool = False) -> None:
@@ -3833,11 +3856,9 @@ class StockPetWidget(QWidget):
         else:
             self.refresh_favorites()
 
-    @Slot(bool)
-    def _apply_us_overnight_bubble(self, enabled: bool) -> None:
-        self.show_us_overnight_bubble = bool(enabled)
-        self.settings.setValue(US_OVERNIGHT_BUBBLE_SETTINGS_KEY, self.show_us_overnight_bubble)
-        self.settings.sync()
+    @Slot(str)
+    def _apply_us_overnight_bubble(self, mode: str) -> None:
+        self.us_overnight_bubble_mode = mode
         self._refresh_bubble_display()
 
     @Slot(int, int, int)
