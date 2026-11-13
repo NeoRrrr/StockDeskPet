@@ -185,6 +185,26 @@ class QuoteRefreshUiTests(unittest.TestCase):
         self.pet._watch_task = WatchlistTask(self.pet.provider, ["01810"])
         self.pet._on_watchlist_result((quotes, []))
 
+    def test_open_refresh_coalesces_behind_batch_and_superseded_tabs_are_not_fetched(self):
+        self.pet._watch_task = WatchlistTask(self.pet.provider, ["01810"])
+        with patch("stock_pet.ui._is_open_for_automatic_refresh", return_value=True), \
+             patch.object(self.panel, "isVisible", return_value=True), \
+             patch.object(self.pet, "refresh_market_page_silent") as refresh:
+            self.pet._refresh_visible_page(["01810", "159516"])
+            self.pet._refresh_visible_page(["01810", "US.NVDA"])
+            self.assertEqual(self.pet._pending_view_symbols, ["US.NVDA"])
+            refresh.assert_not_called()
+            self.pet._on_watchlist_result(([], []))
+            refresh.assert_called_once_with(["US.NVDA"])
+
+    def test_queued_open_refresh_skips_hidden_card(self):
+        self.pet._pending_view_symbols = ["01810"]
+        with patch.object(self.panel, "isVisible", return_value=False), \
+             patch.object(self.pet, "refresh_market_page_silent") as refresh:
+            self.pet._drain_view_refresh()
+            refresh.assert_not_called()
+            self.assertIsNone(self.pet._pending_view_symbols)
+
     def test_hidden_panel_minute_check_and_manual_check_share_one_task(self):
         monitor, provider = self.panel.opend_monitor, self.pet.provider
         dialog = SettingsDialog(self.panel.settings, provider, parent=self.panel, monitor=monitor)

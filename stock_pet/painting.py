@@ -1,4 +1,4 @@
-"""Coalesced redraws and diagnostics for the two translucent top-level windows.
+"""Coalesced redraws and diagnostics for the card and desktop pet.
 
 A Qt Paint event is evidence of paint dispatch, NOT proof that Windows/DWM
 presented the pixels. Native backing-store warnings are recorded separately.
@@ -9,9 +9,47 @@ from time import monotonic
 import weakref
 
 from PySide6.QtCore import QEvent, QObject, QTimer
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QLabel, QWidget
 
 from .diagnostics import record_render_event
+
+
+class DetailPriceLabel(QLabel):
+    """Trace the first *completed child paint* after opening or navigating the card."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._seq = 0
+        self._pending: tuple[int, str, int, float] | None = None
+        self._deadline = QTimer(self)
+        self._deadline.setSingleShot(True)
+        self._deadline.setInterval(1500)
+        self._deadline.timeout.connect(self._on_deadline)
+
+    def expect_frame(self, reason: str, tab: int) -> None:
+        self._seq += 1
+        self._pending = (self._seq, reason, tab, monotonic())
+        record_render_event("DETAIL_FRAME_REQUEST", f"seq={self._seq} action={reason} tab={tab}")
+        self._deadline.start()
+        self.update()
+
+    def cancel_frame(self) -> None:
+        self._pending = None
+        self._deadline.stop()
+
+    def _on_deadline(self) -> None:
+        if self._pending and self.isVisible():
+            seq, reason, tab, _ = self._pending
+            record_render_event("DETAIL_FRAME_LATE", f"seq={seq} action={reason} tab={tab}", warning=True)
+            self.update()  # One asynchronous retry, never a repaint loop.
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._pending is not None:
+            seq, reason, tab, started = self._pending
+            self.cancel_frame()
+            record_render_event("DETAIL_FRAME_PAINTED",
+                                f"seq={seq} action={reason} tab={tab} elapsed_ms={(monotonic()-started)*1000:.0f}")
 
 
 class WindowPaintGuard(QObject):

@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from time import monotonic
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, QSettings, QSize, QStringListModel, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QFontDatabase, QMouseEvent, QPainter, QPainterPath, QPalette, QPen, QPixmap, QRegion
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -40,7 +40,7 @@ from . import __version__
 from .animated_skin import AnimatedSkin, DSH_CANVAS_WIDTH, DSH_SKIN_KEY, ONE_SHOT_STATES
 from .expression_skin import EXPRESSION_SKIN_KEY, ExpressionSkin
 from .diagnostics import trace_ui_operation
-from .painting import WindowPaintGuard
+from .painting import DetailPriceLabel, WindowPaintGuard
 from .hybrid_quote_provider import HybridQuoteProvider
 from .models import Quote, StockSearchResult, US_TIMEZONE, quote_is_older, quote_session_label, us_quote_is_current
 from .quote_provider import TencentQuoteProvider
@@ -1900,6 +1900,7 @@ class QuotePanel(QWidget):
     favorites_changed = Signal(object)
     page_refresh_requested = Signal(object)
     periodic_page_refresh_requested = Signal(object)
+    view_refresh_requested = Signal(object)
     theme_changed = Signal(str)
     bubble_settings_changed = Signal(int, int, int)
     us_overnight_bubble_changed = Signal(str)
@@ -1973,11 +1974,17 @@ class QuotePanel(QWidget):
         self._quote_rows: dict[str, list[tuple[QListWidgetItem, QuoteRowWidget, bool]]] = {}
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # A quote card does not need the per-pixel alpha surface used by the pet.
+        # A native region keeps the corners/margins transparent; whole-window
+        # opacity remains independently adjustable via setWindowOpacity().
         self.setFixedSize(448, 650)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
+        if QApplication.platformName() == "windows":
+            outline = QPainterPath()
+            outline.addRoundedRect(QRectF(self.rect().marginsRemoved(outer.contentsMargins())), 18, 18)
+            self.setMask(QRegion(outline.toFillPolygon().toPolygon()))
         self.card = QFrame()
         self.card.setObjectName("card")
         outer.addWidget(self.card)
@@ -2092,7 +2099,7 @@ class QuotePanel(QWidget):
 
         self.name_label = QLabel("点击桌宠或输入代码拉取行情")
         self.name_label.setObjectName("stockName")
-        self.price_label = QLabel("--")
+        self.price_label = DetailPriceLabel("--")
         self.price_label.setObjectName("price")
         self.change_label = QLabel("--")
         self.change_label.setObjectName("change")
@@ -2154,7 +2161,7 @@ class QuotePanel(QWidget):
         self._dark_stylesheet = (
             """
             QFrame#card {
-                background: rgba(10, 18, 28, 252);
+                background: #0a121c;
                 border: 1px solid #2f3e51;
                 border-radius: 18px;
             }
@@ -2258,7 +2265,7 @@ class QuotePanel(QWidget):
         )
         self._beige_stylesheet = self._dark_stylesheet + """
             QFrame#card {
-                background: rgba(247, 249, 252, 252);
+                background: #f7f9fc;
                 border-color: #b9c7d8;
             }
             QLabel { color: #243247; }
@@ -2541,7 +2548,9 @@ class QuotePanel(QWidget):
         self._select_first_current_tab_item()
         symbols = self._current_tab_refresh_symbols()
         if symbols:
-            self.periodic_page_refresh_requested.emit(symbols)
+            self.view_refresh_requested.emit(symbols)
+        if self.isVisible():
+            self.price_label.expect_frame("tab", index)
         if symbols and not _automatic_refresh_symbols(symbols):
             self.status_label.setText("当前市场已休市，显示最近一次行情")
         self._paint_guard.request("tab_changed")
@@ -3076,6 +3085,9 @@ class QuotePanel(QWidget):
         else:
             self._show_pending_quote(symbol)
 
+        if self.isVisible():
+            self.price_label.expect_frame("selection", self.market_tabs.currentIndex())
+
         if self._active_task is not None:
             self._pending_fetch_symbol = symbol
             self.status_label.setText(
@@ -3255,10 +3267,19 @@ class QuotePanel(QWidget):
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self._refresh_us_session_labels()
+        self.price_label.expect_frame("open", self.market_tabs.currentIndex())
+        symbols = self._current_tab_refresh_symbols()
+        # A search result may be displayed without belonging to the active tab.
+        selected = self._resolved_input_symbol
+        if selected and selected not in symbols:
+            symbols.append(selected)
+        if symbols:
+            self.view_refresh_requested.emit(symbols)
         self._open_tab_refresh_timer.start()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._open_tab_refresh_timer.stop()
+        self.price_label.cancel_frame()
         super().hideEvent(event)
 
 
@@ -3285,6 +3306,7 @@ class StockPetWidget(QWidget):
         self.panel.favorites_changed.connect(self._apply_favorites)
         self.panel.page_refresh_requested.connect(self.refresh_market_page)
         self.panel.periodic_page_refresh_requested.connect(self.refresh_market_page_silent)
+        self.panel.view_refresh_requested.connect(self._refresh_visible_page)
         self.panel.theme_changed.connect(self._on_bubble_theme_changed)
         self.panel.bubble_settings_changed.connect(self._apply_bubble_settings)
         self.panel.us_overnight_bubble_changed.connect(self._apply_us_overnight_bubble)
@@ -3347,6 +3369,7 @@ class StockPetWidget(QWidget):
         self._watch_manual = False
         self._watch_animate = False
         self._pending_page_symbols: list[str] | None = None
+        self._pending_view_symbols: list[str] | None = None
         self._page_refresh_initialized_keys: set[str] = set()
         self._page_initial_retries: dict[str, tuple[int, float]] = {}
         (
@@ -4130,6 +4153,23 @@ class StockPetWidget(QWidget):
         self._start_quote_batch(page_symbols, manual=True, animate=True)
 
     @Slot(object)
+    def _refresh_visible_page(self, symbols: list[str]) -> None:
+        self._pending_view_symbols = None
+        if self._watch_task is None:
+            self.refresh_market_page_silent(symbols)
+        else:
+            eligible = self._automatic_symbols_with_initialization(
+                symbols, self._page_refresh_initialized_keys, self._page_initial_retries,
+            )
+            in_flight = set(self._watch_task.symbols) if self._watch_task.generation == self.provider.generation else set()
+            self._pending_view_symbols = [s for s in eligible if s not in in_flight] or None
+
+    def _drain_view_refresh(self) -> None:
+        symbols, self._pending_view_symbols = self._pending_view_symbols, None
+        if symbols and self.panel.isVisible():
+            self._refresh_visible_page(symbols)
+
+    @Slot(object)
     def refresh_market_page_silent(self, symbols: list[str]) -> None:
         page_symbols = [str(symbol) for symbol in symbols]
         if not page_symbols or self._watch_task is not None:
@@ -4223,6 +4263,8 @@ class StockPetWidget(QWidget):
                 symbols = self._pending_page_symbols
                 self._pending_page_symbols = None
                 QTimer.singleShot(0, lambda: self.refresh_market_page(symbols))
+            elif self._pending_view_symbols:
+                self._drain_view_refresh()
             else:
                 QTimer.singleShot(0, lambda: self.refresh_market_page_silent(requested_symbols))
             if self._opend_refresh_generation is not None:
@@ -4248,6 +4290,7 @@ class StockPetWidget(QWidget):
                 lambda symbols=pending_symbols: self.refresh_market_page(symbols),
             )
         else:
+            self._drain_view_refresh()
             self._refresh_recovered_source()
 
         if not self.alerts_enabled:

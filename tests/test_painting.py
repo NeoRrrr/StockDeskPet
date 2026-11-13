@@ -15,7 +15,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QTimer, Qt, QtM
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from stock_pet.diagnostics import UiStallMonitor, record_render_event
-from stock_pet.painting import WindowPaintGuard
+from stock_pet.painting import DetailPriceLabel, WindowPaintGuard
 
 
 class PaintGuardTests(unittest.TestCase):
@@ -82,6 +82,22 @@ class PaintGuardTests(unittest.TestCase):
         self.pump()
         self.assertEqual(self.guard.flushes, before)
         self.assertEqual(self.guard.painted_revision, self.guard.revision)
+
+    def test_child_paint_completes_navigation_once_without_logging_widget_data(self):
+        label = DetailPriceLabel("private price")
+        self.window.layout().addWidget(label)
+        self.show_ready()
+        with patch("stock_pet.painting.record_render_event") as log:
+            label.expect_frame("tab", 1)
+            label.expect_frame("selection", 1)
+            self.pump()
+            label.update()
+            self.pump()
+            painted = [call for call in log.call_args_list if call.args[0] == "DETAIL_FRAME_PAINTED"]
+            self.assertEqual(len(painted), 1)
+            self.assertIn("seq=2 action=selection tab=1", painted[0].args[1])
+            self.assertNotIn("private price", str(log.call_args_list))
+            self.assertFalse(label._deadline.isActive())
 
     def test_missing_paint_gets_one_bounded_recovery_and_records_resumption(self):
         self.show_ready()

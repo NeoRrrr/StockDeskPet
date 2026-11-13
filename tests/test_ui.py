@@ -190,6 +190,8 @@ class QuotePanelTests(unittest.TestCase):
             panel = QuotePanel(TencentQuoteProvider(), settings)
             captured: list[list[str]] = []
             periodic: list[list[str]] = []
+            views: list[list[str]] = []
+            panel.view_refresh_requested.connect(lambda symbols: views.append(list(symbols)))
             panel.page_refresh_requested.connect(lambda symbols: captured.append(list(symbols)))
             panel.periodic_page_refresh_requested.connect(
                 lambda symbols: periodic.append(list(symbols))
@@ -221,8 +223,9 @@ class QuotePanelTests(unittest.TestCase):
             a_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[0]]
             hk_summary = [symbol for _label, symbol in TAB_MARKET_SUMMARIES[1]]
             self.assertEqual(captured[0], [*DEFAULT_A_SHARE_ETFS, *a_summary])
-            self.assertEqual(periodic[0], [*DEFAULT_HK_WATCHLIST, *hk_summary])
-            self.assertEqual(periodic[1], list(INDEX_SYMBOLS))
+            self.assertEqual(views, [[*DEFAULT_A_SHARE_ETFS, *a_summary],
+                                     [*DEFAULT_HK_WATCHLIST, *hk_summary], list(INDEX_SYMBOLS)])
+            self.assertEqual(periodic, [])
             self.assertEqual(
                 panel.index_list.currentItem().data(Qt.ItemDataRole.UserRole),
                 INDEX_SYMBOLS[0],
