@@ -113,10 +113,9 @@ class USSessionTests(unittest.TestCase):
 
 
 class ExtendedQuoteTests(unittest.TestCase):
-    def test_each_extended_session_uses_actual_trade_price_and_time(self):
+    def test_overnight_and_after_hours_use_actual_trade_price_and_time(self):
         for kind, stamp, day in (
             ("overnight", "2026-11-03 23:59:59.500", "2026-11-04"),
-            ("pre", "2026-11-04 06:01:00.500", "2026-11-04"),
             ("after", "2026-11-03 17:01:00.500", "2026-11-03"),
         ):
             with self.subTest(kind=kind):
@@ -130,6 +129,44 @@ class ExtendedQuoteTests(unittest.TestCase):
                 self.assertIsNone(quote.open_price)
                 self.assertIsNone(quote.turnover_rate)
                 self.assertTrue(us_quote_is_current(quote, parse_us_time(stamp)))
+
+    def test_premarket_ticks_cross_close_without_overriding_snapshot(self):
+        # Replay the two MU trades five seconds apart against a fixed quote.
+        row = {**snapshot("pre"), "last_price": 719.02, "pre_price": 710.77,
+               "pre_change_val": -8.25, "pre_change_rate": -1.147,
+               "pre_high_price": 715, "pre_low_price": 704}
+        for stamp, trade in (("2026-11-17 04:17:29.778", 725.00),
+                             ("2026-11-17 04:17:35.531", 711.14)):
+            with self.subTest(trade=trade):
+                now = parse_us_time(stamp)
+                q = quote_from_futu_row(row, normalize_symbol("MU"), at=now,
+                                        ticks=Rows(tick(stamp, trade, "US.MU")))
+                self.assertEqual((q.price, q.change, q.change_percent, q.direction),
+                                 (710.77, -8.25, -1.147, -1))
+                self.assertEqual((q.previous_close, q.high, q.low), (719.02, 715, 704))
+                self.assertEqual((q.session, q.session_date), ("pre", "2026-11-17"))
+                self.assertEqual(q.display_time, f"最近成交 {stamp}")
+                self.assertTrue(us_quote_is_current(q, now))
+
+    def test_premarket_accepts_actual_quote_changes_and_missing_rate(self):
+        stamp = "2026-11-04 06:01:00.500"
+        for change, rate, expected in ((2, 1.0, 1.0), (0, 0, 0), (-3, float("nan"), -1.5)):
+            with self.subTest(change=change):
+                q = quote_from_futu_row(
+                    {**snapshot("pre"), "pre_price": 200 + change, "pre_change_val": change,
+                     "pre_change_rate": rate}, normalize_symbol("NVDA"),
+                    ticks=Rows(tick(stamp, 198)), at=parse_us_time(stamp))
+                self.assertEqual((q.price, q.change, q.change_percent),
+                                 (200 + change, change, expected))
+
+    def test_premarket_snapshot_without_current_trade_or_valid_reference_is_not_live(self):
+        stamp = "2026-11-04 06:01:00.500"
+        for ticks, changes in ((Rows(), {}), (Rows(tick("2026-11-04 03:59:59")), {}),
+                               (Rows(tick(stamp)), {"pre_change_val": 100})):
+            q = quote_from_futu_row({**snapshot("pre"), **changes}, normalize_symbol("NVDA"),
+                                    ticks=ticks, at=parse_us_time(stamp))
+            self.assertEqual((q.session, q.price), ("regular", 200))
+            self.assertEqual(q.display_time, "2026-11-03 16:00:00.229")
 
     def test_invalid_or_wrong_session_trade_falls_back_without_fake_timestamp(self):
         now = et("2026-11-04 01:01:00")

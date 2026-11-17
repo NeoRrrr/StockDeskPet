@@ -3231,7 +3231,7 @@ class QuotePanel(QWidget):
         time_label = " 美东" if quote.symbol.market in US_MARKETS else ""
         note = quote.session_note or "行情可能延迟，仅供参考，不作为交易依据"
         short_note = note if len(note) <= 42 else note[:41] + "…"
-        _set_text_if_changed(self.status_label, f"{quote.source} · {quote.quote_time}{time_label}\n{short_note}")
+        _set_text_if_changed(self.status_label, f"{quote.source} · {quote.display_time}{time_label}\n{short_note}")
         self.status_label.setToolTip(f"{note}\n行情可能延迟，仅供参考，不作为交易依据")
         self._paint_guard.request("detail_rendered")
         self.quote_loaded.emit(quote)
@@ -4357,7 +4357,7 @@ class StockPetWidget(QWidget):
             self.alert_requested.emit(
                 "股票桌宠提醒",
                 f"{session_prefix}{quote.name} {quote.symbol.display_code} {action} {abs(percent):.2f}%\n"
-                f"首次突破提醒阈值 ±{self.alert_threshold:.1f}% · {quote.quote_time}",
+                f"首次突破提醒阈值 ±{self.alert_threshold:.1f}% · {quote.display_time}",
             )
 
         self._alert_last_percent[symbol_key] = percent

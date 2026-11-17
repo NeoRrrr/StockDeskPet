@@ -47,6 +47,14 @@ class Quote:
     session_note: str = ""
 
     @property
+    def display_time(self) -> str:
+        # OpenD does not timestamp its pre-market aggregate. The timestamp
+        # retained for session validation and ordering belongs to the tape.
+        if self.symbol.market == "us" and self.session == "pre":
+            return f"最近成交 {self.quote_time}"
+        return self.quote_time
+
+    @property
     def direction(self) -> int:
         if self.change_percent > 0:
             return 1

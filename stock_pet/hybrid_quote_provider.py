@@ -126,14 +126,24 @@ def quote_from_futu_row(
         return unavailable("涨跌基准无效")
     if abs(reference - quote.price) > max(0.0005, abs(quote.price) * 0.000001):
         return unavailable("报价与最近常规收盘不一致，等待本时段数据")
-    # Use the timed trade as price authority. Quote aggregates can trail it.
+    if prefix == "pre":
+        # A pre-market odd lot can cross the close while the published quote
+        # stays put. Use one snapshot for all price fields; the tick only
+        # establishes the session and the last known trade time.
+        price = session_price
+        change = session_change
+        rate = _optional_float_value(row, "pre_change_rate")
+        change_percent = rate if rate is not None else change / reference * 100
+    else:
+        change = price - reference
+        change_percent = change / reference * 100
     high = _optional_float_value(row, f"{prefix}_high_price")
     low = _optional_float_value(row, f"{prefix}_low_price")
     return replace(
         quote, price=price, previous_close=reference, open_price=None,
         high=max(high, price) if high is not None and high > 0 else None,
         low=min(low, price) if low is not None and low > 0 else None,
-        change=price - reference, change_percent=(price - reference) / reference * 100,
+        change=change, change_percent=change_percent,
         volume=_optional_float_value(row, f"{prefix}_volume"),
         amount=_optional_float_value(row, f"{prefix}_turnover"), turnover_rate=None,
         quote_time=stamp.replace(tzinfo=None).isoformat(sep=" ", timespec="milliseconds"),
